@@ -1,3 +1,0 @@
-crewai[tools]
-youtube-transcript-api
-openai
