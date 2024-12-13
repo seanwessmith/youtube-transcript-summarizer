@@ -1,0 +1,16 @@
+{
+  "name": "ts",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "1.1.14"
+  },
+  "peerDependencies": {
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.73.1",
+    "youtube-transcript": "^1.2.1"
+  }
+}
