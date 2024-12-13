@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 import { YoutubeTranscript } from "youtube-transcript";
 import OpenAI from "openai";
 import { Database } from "bun:sqlite";
+import readline from "readline";
 
 interface Transcript {
   text: string;
@@ -39,17 +40,30 @@ const getVideoId = (url: string): string => {
   return match ? match[1] : "";
 };
 
+const summarizeTranscript = async (transcript: string): Promise<string> => {
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: "Summarize transcripts concisely." },
+      { role: "user", content: `Summarize this transcript:\n\n${transcript}` },
+    ],
+    temperature: 0.5,
+  });
+  return response.choices[0].message.content || "";
+};
+
 const getOrCreateTranscript = async (
   db: Database,
   videoUrl: string
 ): Promise<VideoData> => {
   const videoId = getVideoId(videoUrl);
+  if (!videoId) {
+    throw new Error("Invalid YouTube URL. Could not extract video ID.");
+  }
 
   // Check if we already have this video
-  const query = db.query(
-    "SELECT * FROM videos WHERE video_id = $videoId;",
-  );
-  const existing = query.get({ $videoId: videoId }) as VideoData;
+  const query = db.query("SELECT * FROM videos WHERE video_id = $videoId;");
+  const existing = query.get({ $videoId: videoId }) as VideoData | undefined;
   if (existing) {
     return {
       transcript: existing.transcript,
@@ -71,23 +85,9 @@ const getOrCreateTranscript = async (
   return { transcript, summary };
 };
 
-const summarizeTranscript = async (
-  transcript: string,
-): Promise<string> => {
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: "Summarize transcripts concisely." },
-      { role: "user", content: `Summarize this transcript:\n\n${transcript}` },
-    ],
-    temperature: 0.5,
-  });
-  return response.choices[0].message.content || "";
-};
-
 const answerQuestion = async (
   transcript: string,
-  question: string,
+  question: string
 ): Promise<string> => {
   const response = await openai.chat.completions.create({
     model: "gpt-4o",
@@ -105,24 +105,37 @@ const answerQuestion = async (
 
 const main = async () => {
   const db = await initDb();
-  const videoUrl = "https://www.youtube.com/watch?v=ygaEBHYllPU";
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  // Prompt user for YouTube URL
+  const videoUrl = await new Promise<string>((resolve) => {
+    rl.question("Please enter the YouTube URL: ", (answer) => {
+      resolve(answer.trim());
+    });
+  });
 
   try {
     const { transcript, summary } = await getOrCreateTranscript(db, videoUrl);
     console.log("\nSummary:", summary);
 
-    const readline = require("readline").createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+    // Count how many transcripts have been stored
+    const countQuery = db.query("SELECT COUNT(*) as count FROM videos;");
+    const { count } = countQuery.get() as { count: number };
+    console.log(
+      `\nThere are currently ${count} transcript(s) stored in the database.`
+    );
 
     const askQuestion = () => {
-      readline.question(
+      rl.question(
         '\nQuestion about transcript (or "exit"): ',
         async (question: string) => {
           if (question.toLowerCase() === "exit") {
             await db.close();
-            readline.close();
+            rl.close();
             return;
           }
 
@@ -137,6 +150,7 @@ const main = async () => {
   } catch (error) {
     console.error("Error in main:", error);
     await db.close();
+    rl.close();
   }
 };
 
