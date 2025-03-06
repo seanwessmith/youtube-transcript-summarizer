@@ -1,9 +1,10 @@
 import dotenv from "dotenv";
-import { YoutubeTranscript } from "youtube-transcript";
+// import { YoutubeTranscript } from "youtube-transcript";
 import OpenAI from "openai";
 import { Database } from "bun:sqlite";
 import readline from "readline";
 import { spawn } from "child_process";
+import { fetchTranscript } from "./utils/youtube-transcript-fetcher";
 
 dotenv.config();
 
@@ -14,8 +15,8 @@ const rl = readline.createInterface({
 });
 
 // Configurable models via environment variables
-const summaryModel = process.env.SUMMARY_MODEL || "o1-mini";
-const qaModel = process.env.QA_MODEL || "o1-mini";
+const summaryModel = process.env.SUMMARY_MODEL || "o3-mini";
+const qaModel = process.env.QA_MODEL || "o3-mini";
 const embeddingModel = "text-embedding-ada-002";
 
 interface VideoData {
@@ -100,9 +101,9 @@ const getOrCreateTranscript = async (
     .get({ $videoId: videoId }) as VideoData | null;
   if (existing) return existing;
 
-  let transcript: string;
+  let transcript: string | undefined = undefined;
   try {
-    const transcriptList = await YoutubeTranscript.fetchTranscript(videoId);
+    const transcriptList = await fetchTranscript(videoId);
     transcript = transcriptList.map((entry) => entry.text).join(" ");
   } catch (error) {
     if (
@@ -116,8 +117,6 @@ const getOrCreateTranscript = async (
     }
   }
 
-  await Bun.write(`transcript_${videoId}.txt`, transcript);
-  console.log(`Transcript saved to transcript_${videoId}.txt`);
   const summary = await summarizeTranscript(transcript);
   db.run(
     "INSERT INTO videos (video_id, transcript, summary) VALUES (?, ?, ?)",

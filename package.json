@@ -6,20 +6,18 @@
     "start": "bun run src/index.ts"
   },
   "devDependencies": {
-    "@types/bun": "1.1.17",
-    "@types/omelette": "^0.4.4",
-    "@types/pdf-parse": "^1.1.4"
+    "@types/bun": "1.2.4",
+    "@types/pdf-parse": "^1.1.4",
+    "@types/xml2js": "^0.4.14"
   },
   "peerDependencies": {
-    "typescript": "^5.7.3"
+    "typescript": "^5.8.2"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^1.1.14",
     "dotenv": "^16.4.7",
-    "jwplayer-scraper": "^1.2.0",
-    "omelette": "^0.4.17",
-    "openai": "^4.79.1",
+    "node-abort-controller": "^3.1.1",
+    "openai": "^4.86.2",
     "pdf-parse": "^1.1.1",
-    "youtube-transcript": "^1.2.1"
+    "xml2js": "^0.6.2"
   }
 }
