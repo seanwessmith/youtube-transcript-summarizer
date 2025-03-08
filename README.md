@@ -34,12 +34,10 @@ cd yt-transcript-summarizer
 
 ### 2. Install Dependencies
 
-Install Node.js dependencies using `npm` or `yarn`:
+Install Node.js dependencies using `bun`:
 
 ```bash
-npm install
-# or
-yarn install
+bun install
 ```
 
 ### 3. Set Up Environment Variables
@@ -52,10 +50,10 @@ OPENAI_API_KEY=your_openai_api_key_here
 
 ### 4. Run the Program
 
-Use Bun to run the script (assuming Bun is installed):
+Use Bun to run the script:
 
 ```bash
-bun run index.ts
+bun run youtube
 ```
 
 When prompted, enter a YouTube URL:
