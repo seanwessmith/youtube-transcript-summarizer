@@ -3,7 +3,7 @@
   "module": "index.ts",
   "type": "module",
   "scripts": {
-    "start": "bun run src/index.ts"
+    "youtube": "bun run src/youtube.ts"
   },
   "devDependencies": {
     "@types/bun": "1.2.4",
@@ -14,6 +14,7 @@
     "typescript": "^5.8.2"
   },
   "dependencies": {
+    "axios": "^1.8.1",
     "dotenv": "^16.4.7",
     "node-abort-controller": "^3.1.1",
     "openai": "^4.86.2",
