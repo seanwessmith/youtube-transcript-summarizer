@@ -3,22 +3,32 @@
   "module": "index.ts",
   "type": "module",
   "scripts": {
-    "youtube": "bun run src/youtube.ts"
+    "compile-cpp": "g++ -std=c++17 src/transcribe.cpp -o src/transcribe",
+    "youtube": "bun run compile-cpp && bun run src/youtube.ts"
   },
   "devDependencies": {
-    "@types/bun": "1.2.4",
-    "@types/pdf-parse": "^1.1.4",
+    "@types/bun": "1.2.15",
+    "@types/pdf-parse": "^1.1.5",
     "@types/xml2js": "^0.4.14"
   },
   "peerDependencies": {
-    "typescript": "^5.8.2"
+    "typescript": "^5.8.3"
   },
   "dependencies": {
-    "axios": "^1.8.1",
-    "dotenv": "^16.4.7",
+    "@langchain/anthropic": "^0.3.21",
+    "@langchain/cohere": "^0.3.3",
+    "@langchain/google-genai": "^0.2.10",
+    "@langchain/openai": "^0.5.11",
+    "axios": "^1.9.0",
+    "dotenv": "^16.5.0",
+    "langchain": "^0.3.27",
     "node-abort-controller": "^3.1.1",
-    "openai": "^4.86.2",
+    "openai": "^5.0.1",
     "pdf-parse": "^1.1.1",
-    "xml2js": "^0.6.2"
+    "playwright": "^1.53.1",
+    "xml2js": "^0.6.2",
+    "youtube-transcript": "^1.2.1",
+    "youtube-transcript-api": "^3.0.6",
+    "youtube-transcript-plus": "^1.0.4"
   }
 }
