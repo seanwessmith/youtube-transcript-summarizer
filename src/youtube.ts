@@ -59,8 +59,8 @@ const ask = (q: string) =>
 // --- Configurable providers & models ---
 const PROVIDERS = {
   LLM: process.env.LLM_PROVIDER?.toLowerCase() || "google-genai",
-  SUMMARY_MODEL: process.env.SUMMARY_MODEL || "gemini-2.5-pro-preview-06-05",
-  QA_MODEL: process.env.QA_MODEL || "gemini-2.5-pro-preview-06-05",
+  SUMMARY_MODEL: process.env.SUMMARY_MODEL || "gemini-2.5-pro",
+  QA_MODEL: process.env.QA_MODEL || "gemini-2.5-pro",
   EMBEDDING: process.env.EMBEDDING_PROVIDER?.toLowerCase() || "openai",
   EMBEDDING_MODEL: process.env.EMBEDDING_MODEL || "text-embedding-ada-002",
 };
@@ -262,7 +262,7 @@ async function getOrCreateTranscript(
     const summary = await summarize(transcript);
     db.run(
       "INSERT INTO content (content_id, content_type, title, author, transcript, summary) VALUES (?, ?, ?, ?, ?, ?)",
-      [videoId, "youtube", "YouTube Video", "", transcript, summary]
+      [videoId, "youtube", title, "", transcript, summary]
     );
     return {
       content_id: videoId,
