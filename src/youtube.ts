@@ -1,28 +1,24 @@
 import dotenv from "dotenv";
-import { spawn } from "child_process";
-import readline from "readline";
 import axios from "axios";
 import { parseStringPromise } from "xml2js";
 import { Database } from "bun:sqlite";
-import fs from "fs";
 import path from "path";
 import { ChatOpenAI, OpenAIEmbeddings } from "@langchain/openai";
-import { ChatAnthropic } from "@langchain/anthropic";
-import { CohereEmbeddings } from "@langchain/cohere";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 import inquirer from "inquirer";
-import { gzipSync, gunzipSync } from "zlib";
-import { Buffer } from "node:buffer";
 import { $ } from "bun";
 
-/* helper ───────────────────────────────*/
-const gz = (txt: string) =>
-  gzipSync(Buffer.from(txt, "utf8").toBase64()).toBase64();
-const gunz = (buf: Buffer | string) =>
-  typeof buf === "string"
-    ? buf // already plain text
-    : gunzipSync(buf.toBase64()).toString("utf8");
+const zip = (txt: string): Uint8Array => {
+  const encoded = new TextEncoder().encode(txt);
+  return Bun.gzipSync(encoded);
+};
+
+const unzip = (txt: string) => {
+  const dec = new TextDecoder();
+  const uncompressed = Bun.gunzipSync(txt);
+  return dec.decode(uncompressed);
+};
 
 // ────────────────────────────────────────────────────────────────
 // 1. Environment & util setup
@@ -35,12 +31,6 @@ const TRANSCRIBE_BIN = process.env.TRANSCRIBE_BIN || "./src/transcribe";
 const WHISPER_MODEL_PATH =
   process.env.WHISPER_MODEL_PATH || "./whisper.cpp/models/ggml-base.en.bin";
 
-interface CaptionCue {
-  start: number;
-  end: number;
-  text: string;
-}
-
 // ────────────────────────────────────────────────────────────────
 // 2. Caption retrieval (uses yt-dlp directly – no Invidious needed)
 // ────────────────────────────────────────────────────────────────
@@ -49,54 +39,44 @@ async function fetchCaptionsWithYtDlp(
   videoUrl: string,
   videoId: string
 ): Promise<string | null> {
-  const tmpDir = path.join("./tmp");
-  await fs.promises.mkdir(tmpDir, { recursive: true });
+  const tmpDir = "./tmp";
+  const vttPath = path.join(tmpDir, `${videoId}.en.vtt`);
 
-  // yt-dlp writes captions to `<id>.en.vtt` when using these flags
-  const proc = spawn(YTDLP_BIN, [
-    "--write-auto-sub",
-    "--sub-lang",
-    "en",
-    "--sub-format",
-    "vtt",
-    "--skip-download",
-    "-o",
-    path.join(tmpDir, "%(id)s.%(ext)s"),
-    videoUrl,
-  ]);
+  // Create tmp directory
+  await $`mkdir -p ${tmpDir}`.quiet();
 
-  let stderr = "";
-  proc.stderr.on("data", (d) => (stderr += d.toString()));
+  try {
+    // Run yt-dlp to download captions
+    await $`${YTDLP_BIN} \
+      --write-auto-sub \
+      --sub-lang en \
+      --sub-format vtt \
+      --skip-download \
+      -o ${path.join(tmpDir, "%(id)s.%(ext)s")} \
+      ${videoUrl}`.quiet();
 
-  return new Promise((resolve) => {
-    proc.on("close", async (code) => {
-      if (code !== 0) {
-        console.warn(`yt-dlp exited ${code}:\n${stderr}`);
-        return resolve(null);
-      }
-      const vttPath = path.join(tmpDir, `${videoId}.en.vtt`);
-      try {
-        const raw = await fs.promises.readFile(vttPath, "utf8");
-        // simple VTT → plain-text converter
-        const transcript = raw
-          .split(/\r?\n/)
-          .filter(
-            (line) =>
-              line &&
-              !/^WEBVTT/.test(line) &&
-              !/^\d+$/.test(line) && // cue index lines
-              !/-->/.test(line) // timestamp lines
-          )
-          .join(" ")
-          .replace(/\s+/g, " ")
-          .trim();
-        return resolve(transcript || null);
-      } catch (err) {
-        console.warn("Failed to read VTT:", err);
-        return resolve(null);
-      }
-    });
-  });
+    // Read and process the VTT file
+    const raw = await Bun.file(vttPath).text();
+
+    // Convert VTT to plain text
+    const transcript = raw
+      .split(/\r?\n/)
+      .filter(
+        (line) =>
+          line &&
+          !/^WEBVTT/.test(line) &&
+          !/^\d+$/.test(line) && // cue index lines
+          !/-->/.test(line) // timestamp lines
+      )
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    return transcript || null;
+  } catch (err) {
+    console.warn("Failed to fetch captions:", err);
+    return null;
+  }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -119,17 +99,16 @@ const getVideoId = (url: string) => {
 // ────────────────────────────────────────────────────────────────
 
 async function fetchOrTranscribe(audioUrl: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(TRANSCRIBE_BIN, [audioUrl, WHISPER_MODEL_PATH]);
-    let out = "";
-    proc.stdout.on("data", (d) => (out += d.toString()));
-    proc.stderr.on("data", (d) => console.error(d.toString()));
-    proc.on("close", (code) =>
-      code === 0
-        ? resolve(out.trim())
-        : reject(new Error(`Transcriber exited ${code}`))
+  try {
+    const { stdout } =
+      await $`${TRANSCRIBE_BIN} ${audioUrl} ${WHISPER_MODEL_PATH}`;
+    return stdout.toString().trim();
+  } catch (err) {
+    console.error("Transcription failed:", err);
+    throw new Error(
+      `Transcriber failed: ${err instanceof Error ? err.message : String(err)}`
     );
-  });
+  }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -152,11 +131,6 @@ function createChatModel(provider: string, model: string) {
         openAIApiKey: process.env.OPENAI_API_KEY,
         modelName: model,
       });
-    case "anthropic":
-      return new ChatAnthropic({
-        anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-        modelName: model,
-      });
     case "google-genai":
       return new ChatGoogleGenerativeAI({
         apiKey: process.env.GEMINI_API_KEY,
@@ -173,11 +147,6 @@ function createEmbeddingModel(provider: string, model: string) {
       return new OpenAIEmbeddings({
         openAIApiKey: process.env.OPENAI_API_KEY,
         modelName: model,
-      });
-    case "cohere":
-      return new CohereEmbeddings({
-        apiKey: process.env.COHERE_API_KEY,
-        model,
       });
     default:
       throw new Error(`Unsupported embedding provider: ${provider}`);
@@ -209,7 +178,6 @@ async function initDb(): Promise<Database> {
       created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
-    /* new table */
     CREATE TABLE IF NOT EXISTS qa (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       content_id  TEXT NOT NULL,
@@ -220,11 +188,11 @@ async function initDb(): Promise<Database> {
     );
   `);
   /* turn on incremental auto-vacuum (first run triggers a VACUUM) */
-  db.exec(`
-    PRAGMA auto_vacuum = INCREMENTAL;
-    PRAGMA journal_mode = WAL;
-    VACUUM;
-  `);
+  // db.exec(`
+  //   PRAGMA auto_vacuum = INCREMENTAL;
+  //   PRAGMA journal_mode = WAL;
+  //   VACUUM;
+  // `);
 
   return db;
 }
@@ -269,7 +237,8 @@ async function getOrCreateTranscript(
       )
       .get(videoId) as ContentData;
     if (existing) {
-      existing.transcript = gunz(existing.transcript); // ← inflate
+      existing.transcript = unzip(existing.transcript); // ← inflate
+      console.log(existing.transcript);
       return existing as ContentData;
     }
 
@@ -281,12 +250,13 @@ async function getOrCreateTranscript(
 
     const title = await fetchYoutubeTitleOEmbed(videoId);
     const summary = await summarize(transcript);
+    console.log("storing", videoId, title, summary);
+    const zipped = zip(transcript);
     db.run(
-      `INSERT INTO content
-   (content_id, content_type, title, author, transcript, summary)
-   VALUES (?, ?, ?, ?, ?, ?)`,
-      [videoId, "youtube", title, "", gz(transcript), summary] // ← gzip here
+      `INSERT INTO content (content_id, content_type, title, author, transcript, summary) VALUES (?, ?, ?, ?, ?, ?)`,
+      [videoId, "youtube", title, "", zipped, summary]
     );
+    console.log("Transcript stored for", videoId);
     return {
       content_id: videoId,
       content_type: "youtube",
@@ -400,7 +370,7 @@ async function getOrCreateTranscript(
       info.title,
       info.author,
       info.audioUrl,
-      gz(transcript), // gzip
+      zip(transcript), // gzip
       summary,
     ]
   );
@@ -473,13 +443,6 @@ async function restoreSession(
 // 9. CLI interaction loop (unchanged except log tweaks)
 // ────────────────────────────────────────────────────────────────
 
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-});
-const ask = (q: string) =>
-  new Promise<string>((res) => rl.question(q, (ans) => res(ans.trim())));
-
 async function main() {
   const db = await initDb();
   try {
@@ -529,7 +492,7 @@ async function main() {
         .query("SELECT * FROM content WHERE content_id = ?")
         .get(pick) as ContentData;
       if (!data) throw new Error("Session not found in DB");
-      data.transcript = gunz(data.transcript);
+      data.transcript = unzip(data.transcript);
     }
 
     console.log(`\nTitle: ${data.title}`);
@@ -551,7 +514,7 @@ async function main() {
       const { sel } = await inquirer.prompt<{ sel: string | number }>({
         name: "sel",
         type: "list",
-        message: "Questions:",
+        message: `Questions (${PROVIDERS.QA_MODEL}):`,
         choices: [
           { name: "🆕  New question", value: "__new" },
           ...qaRows.map((r) => ({ name: r.question, value: r.id })),
@@ -582,9 +545,8 @@ async function main() {
   } catch (err: any) {
     console.error("Error:", err.message);
   } finally {
-    await $`rm -rf transcripts.sqlite-wal transcripts.sqlite-shm`;
+    db.close(true);
     await new Promise((res) => setTimeout(res, 1000)); // give it a moment to finish
-    db.close();
   }
 }
 
