@@ -12,6 +12,17 @@ import { CohereEmbeddings } from "@langchain/cohere";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 import inquirer from "inquirer";
+import { gzipSync, gunzipSync } from "zlib";
+import { Buffer } from "node:buffer";
+import { $ } from "bun";
+
+/* helper ───────────────────────────────*/
+const gz = (txt: string) =>
+  gzipSync(Buffer.from(txt, "utf8").toBase64()).toBase64();
+const gunz = (buf: Buffer | string) =>
+  typeof buf === "string"
+    ? buf // already plain text
+    : gunzipSync(buf.toBase64()).toString("utf8");
 
 // ────────────────────────────────────────────────────────────────
 // 1. Environment & util setup
@@ -193,7 +204,7 @@ async function initDb(): Promise<Database> {
       title        TEXT,
       author       TEXT,
       audio_url    TEXT,
-      transcript   TEXT,
+      transcript   BLOB,
       summary      TEXT,
       created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -208,6 +219,13 @@ async function initDb(): Promise<Database> {
       FOREIGN KEY (content_id) REFERENCES content(content_id)
     );
   `);
+  /* turn on incremental auto-vacuum (first run triggers a VACUUM) */
+  db.exec(`
+    PRAGMA auto_vacuum = INCREMENTAL;
+    PRAGMA journal_mode = WAL;
+    VACUUM;
+  `);
+
   return db;
 }
 
@@ -250,7 +268,10 @@ async function getOrCreateTranscript(
         "SELECT * FROM content WHERE content_id = ? AND content_type = 'youtube'"
       )
       .get(videoId) as ContentData;
-    if (existing) return existing;
+    if (existing) {
+      existing.transcript = gunz(existing.transcript); // ← inflate
+      return existing as ContentData;
+    }
 
     // 1️⃣ Try yt-dlp captions
     let transcript = await fetchCaptionsWithYtDlp(url, videoId);
@@ -261,8 +282,10 @@ async function getOrCreateTranscript(
     const title = await fetchYoutubeTitleOEmbed(videoId);
     const summary = await summarize(transcript);
     db.run(
-      "INSERT INTO content (content_id, content_type, title, author, transcript, summary) VALUES (?, ?, ?, ?, ?, ?)",
-      [videoId, "youtube", title, "", transcript, summary]
+      `INSERT INTO content
+   (content_id, content_type, title, author, transcript, summary)
+   VALUES (?, ?, ?, ?, ?, ?)`,
+      [videoId, "youtube", title, "", gz(transcript), summary] // ← gzip here
     );
     return {
       content_id: videoId,
@@ -368,14 +391,16 @@ async function getOrCreateTranscript(
 
   const summary = await summarize(transcript);
   db.run(
-    "INSERT INTO content (content_id, content_type, title, author, audio_url, transcript, summary) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    `INSERT INTO content
+   (content_id, content_type, title, author, audio_url, transcript, summary)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
       contentId,
       "apple_podcast",
       info.title,
       info.author,
       info.audioUrl,
-      transcript,
+      gz(transcript), // gzip
       summary,
     ]
   );
@@ -464,7 +489,12 @@ async function main() {
         `SELECT content_id, title, content_type, DATE(created_at) AS created
          FROM content ORDER BY created_at DESC`
       )
-      .all() as { content_id: string; title: string; content_type: string; created: string }[];
+      .all() as {
+      content_id: string;
+      title: string;
+      content_type: string;
+      created: string;
+    }[];
 
     /* ② build choices list */
     const menuChoices = [
@@ -499,6 +529,7 @@ async function main() {
         .query("SELECT * FROM content WHERE content_id = ?")
         .get(pick) as ContentData;
       if (!data) throw new Error("Session not found in DB");
+      data.transcript = gunz(data.transcript);
     }
 
     console.log(`\nTitle: ${data.title}`);
@@ -511,12 +542,16 @@ async function main() {
         .query(
           "SELECT id, question, answer FROM qa WHERE content_id = ? ORDER BY created_at DESC"
         )
-        .all(data.content_id) as { id: number; question: string; answer: string }[]; 
+        .all(data.content_id) as {
+        id: number;
+        question: string;
+        answer: string;
+      }[];
 
       const { sel } = await inquirer.prompt<{ sel: string | number }>({
         name: "sel",
         type: "list",
-        message: "Select a question (or choose New question):",
+        message: "Questions:",
         choices: [
           { name: "🆕  New question", value: "__new" },
           ...qaRows.map((r) => ({ name: r.question, value: r.id })),
@@ -532,7 +567,7 @@ async function main() {
         const { newQ } = await inquirer.prompt<{ newQ: string }>({
           name: "newQ",
           type: "input",
-          message: "Ask your question:",
+          message: "question:",
         });
         if (!newQ.trim()) continue;
 
@@ -547,7 +582,9 @@ async function main() {
   } catch (err: any) {
     console.error("Error:", err.message);
   } finally {
-    await db.close();
+    await $`rm -rf transcripts.sqlite-wal transcripts.sqlite-shm`;
+    await new Promise((res) => setTimeout(res, 1000)); // give it a moment to finish
+    db.close();
   }
 }
 
