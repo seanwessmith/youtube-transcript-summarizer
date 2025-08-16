@@ -7,28 +7,29 @@
     "youtube": "bun run compile-cpp && bun run src/youtube.ts"
   },
   "devDependencies": {
-    "@types/bun": "1.2.18",
+    "@types/bun": "1.2.20",
     "@types/pdf-parse": "^1.1.5",
     "@types/xml2js": "^0.4.14"
   },
   "peerDependencies": {
-    "typescript": "^5.8.3"
+    "typescript": "^5.9.2"
   },
   "dependencies": {
-    "@langchain/anthropic": "^0.3.24",
+    "@langchain/anthropic": "^0.3.26",
     "@langchain/cohere": "^0.3.4",
-    "@langchain/core": "^0.3.62",
-    "@langchain/google-genai": "^0.2.14",
-    "@langchain/openai": "^0.6.0",
-    "axios": "^1.10.0",
-    "dotenv": "^17.2.0",
-    "inquirer": "^12.7.0",
+    "@langchain/core": "^0.3.71",
+    "@langchain/google-genai": "^0.2.16",
+    "@langchain/openai": "^0.6.7",
+    "axios": "^1.11.0",
+    "dotenv": "^17.2.1",
+    "inquirer": "^12.9.2",
     "langchain": "^0.3.30",
     "lzma-native": "^8.0.6",
     "node-abort-controller": "^3.1.1",
-    "openai": "^5.9.2",
+    "openai": "^5.12.2",
+    "p-limit": "^7.0.0",
     "pdf-parse": "^1.1.1",
-    "playwright": "^1.54.1",
+    "playwright": "^1.54.2",
     "simple-zstd": "^1.4.2",
     "xml2js": "^0.6.2",
     "youtube-transcript": "^1.2.1",

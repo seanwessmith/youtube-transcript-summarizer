@@ -238,7 +238,6 @@ async function getOrCreateTranscript(
       .get(videoId) as ContentData;
     if (existing) {
       existing.transcript = unzip(existing.transcript); // ← inflate
-      console.log(existing.transcript);
       return existing as ContentData;
     }
 
