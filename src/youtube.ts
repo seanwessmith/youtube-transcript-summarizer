@@ -249,7 +249,6 @@ async function getOrCreateTranscript(
 
     const title = await fetchYoutubeTitleOEmbed(videoId);
     const summary = await summarize(transcript);
-    console.log("storing", videoId, title, summary);
     const zipped = zip(transcript);
     db.run(
       `INSERT INTO content (content_id, content_type, title, author, transcript, summary) VALUES (?, ?, ?, ?, ?, ?)`,
