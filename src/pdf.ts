@@ -19,7 +19,7 @@ const openai = new OpenAI({
 const initDb = async () => {
   const db = new Database("pdfs.sqlite");
 
-  db.exec(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS pdfs (
       pdf_id TEXT PRIMARY KEY,
       transcript TEXT,
@@ -56,6 +56,7 @@ const getOrCreateTranscript = async (
   // Check if we already have this PDF in the database
   const query = db.query("SELECT * FROM pdfs WHERE pdf_id = $pdfId;");
   const existing = query.get({ $pdfId: pdfId }) as PdfData | undefined;
+  console.log("existing", existing?.transcript);
   if (existing) {
     return {
       transcript: existing.transcript,
