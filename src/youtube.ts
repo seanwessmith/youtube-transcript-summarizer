@@ -3,8 +3,7 @@ import axios from "axios";
 import { parseStringPromise } from "xml2js";
 import { Database } from "bun:sqlite";
 import path from "path";
-import { google } from "@ai-sdk/google";
-import { generateText, embed } from "ai";
+import { GoogleGenAI } from "@google/genai";
 import { $ } from "bun";
 
 const zip = (txt: string): Uint8Array => {
@@ -136,6 +135,8 @@ async function fetchOrTranscribe(audioUrl: string): Promise<string> {
 // ────────────────────────────────────────────────────────────────
 // 5. LLM & embedding setup (using Gemini)
 // ────────────────────────────────────────────────────────────────
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const defaultModel = "gemini-3-pro-preview";
 const PROVIDERS = {
@@ -388,7 +389,7 @@ async function retryWithBackoff<T>(
     } catch (err: any) {
       lastError = err;
 
-      // Check if this is a rate limit error
+      // Check if this is a retryable error
       const errorMessage = err?.message || "";
       const isRateLimitError =
         errorMessage.includes("Too Many Requests") ||
@@ -397,8 +398,17 @@ async function retryWithBackoff<T>(
         err?.status === 429 ||
         err?.statusCode === 429;
 
-      if (!isRateLimitError || attempt === maxRetries - 1) {
-        // Not a rate limit error or final attempt - throw it
+      const isTimeoutError =
+        errorMessage.includes("timeout") ||
+        errorMessage.includes("TimeoutError") ||
+        errorMessage.includes("aborted") ||
+        err?.name === "TimeoutError" ||
+        err?.name === "AbortError";
+
+      const isRetryable = isRateLimitError || isTimeoutError;
+
+      if (!isRetryable || attempt === maxRetries - 1) {
+        // Not a retryable error or final attempt - throw it
         const errorDetails = err?.cause?.message || err?.message || String(err);
         throw new Error(`Gemini API Error: ${errorDetails}`);
       }
@@ -408,8 +418,9 @@ async function retryWithBackoff<T>(
       const jitter = Math.random() * 1000;
       const delay = baseDelay + jitter;
 
+      const reason = isTimeoutError ? "Timeout" : "Rate limited";
       console.log(
-        `Rate limited. Waiting ${Math.round(delay / 1000)}s before retry ${attempt + 1}/${maxRetries}...`
+        `${reason}. Waiting ${Math.round(delay / 1000)}s before retry ${attempt + 1}/${maxRetries}...`
       );
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
@@ -431,20 +442,26 @@ function chunkTranscript(transcript: string): string[] {
   while (start < words.length) {
     const end = Math.min(start + MAX_WORDS_PER_CHUNK, words.length);
     chunks.push(words.slice(start, end).join(" "));
+    // Break if we've reached the end
+    if (end >= words.length) break;
+    // Move forward with overlap for context
     start = end - CHUNK_OVERLAP_WORDS;
-    if (start >= words.length) break;
   }
   return chunks;
 }
 
 async function summarizeChunk(chunk: string, chunkNum?: number, totalChunks?: number): Promise<string> {
   const chunkInfo = totalChunks && totalChunks > 1 ? ` (part ${chunkNum} of ${totalChunks})` : "";
-  const { text } = await retryWithBackoff(() =>
-    generateText({
-      model: google(PROVIDERS.SUMMARY_MODEL),
-      prompt: `You are an expert content analyst specializing in extracting insights from video and podcast transcripts${chunkInfo}.
+  const wordCount = chunk.split(/\s+/).length;
+  console.log(`Sending ${wordCount} words to ${PROVIDERS.SUMMARY_MODEL}...`);
+  const response = await retryWithBackoff(() =>
+    ai.models.generateContent({
+      model: PROVIDERS.SUMMARY_MODEL,
+      contents: `Analyze this transcript:\n\n${chunk}`,
+      config: {
+        systemInstruction: `You are an expert content analyst specializing in extracting insights from video and podcast transcripts${chunkInfo}.
 
-Analyze this transcript and provide:
+Analyze the transcript and provide:
 
 ## Key Points
 - List 3-5 main ideas, arguments, or themes discussed
@@ -461,13 +478,11 @@ Analyze this transcript and provide:
 - Practical advice or recommendations given
 - Things the viewer/listener should consider doing
 
-Be specific and factual. Preserve technical terms and proper nouns exactly as used.
-
-Transcript:
-${chunk}`,
+Be specific and factual. Preserve technical terms and proper nouns exactly as used.`,
+      },
     })
   );
-  return text;
+  return response.text || "";
 }
 
 async function summarize(transcript: string): Promise<string> {
@@ -490,10 +505,12 @@ async function summarize(transcript: string): Promise<string> {
   }
 
   console.log("Combining chunk summaries into final summary...");
-  const { text } = await retryWithBackoff(() =>
-    generateText({
-      model: google(PROVIDERS.SUMMARY_MODEL),
-      prompt: `You are an expert content analyst. Below are analyses from different parts of a long transcript.
+  const response = await retryWithBackoff(() =>
+    ai.models.generateContent({
+      model: PROVIDERS.SUMMARY_MODEL,
+      contents: `Synthesize these part analyses into a final summary:\n\n${chunkSummaries.map((s, i) => `=== Part ${i + 1} ===\n${s}`).join("\n\n")}`,
+      config: {
+        systemInstruction: `You are an expert content analyst. You will receive analyses from different parts of a long transcript.
 
 Synthesize them into a single cohesive summary following this structure:
 
@@ -512,20 +529,20 @@ Synthesize them into a single cohesive summary following this structure:
 - Combined practical advice and recommendations
 - Remove duplicates, keep the most actionable items
 
-Remove redundancy from overlapping sections. Preserve specificity and technical accuracy.
-
-Part analyses:
-${chunkSummaries.map((s, i) => `=== Part ${i + 1} ===\n${s}`).join("\n\n")}`,
+Remove redundancy from overlapping sections. Preserve specificity and technical accuracy.`,
+      },
     })
   );
-  return text;
+  return response.text || "";
 }
 
 async function answer(transcript: string, question: string): Promise<string> {
-  const { text } = await retryWithBackoff(() =>
-    generateText({
-      model: google(PROVIDERS.QA_MODEL),
-      prompt: `You are answering questions about a video/podcast transcript. Your role is to be a helpful assistant that has "watched" this content.
+  const response = await retryWithBackoff(() =>
+    ai.models.generateContent({
+      model: PROVIDERS.QA_MODEL,
+      contents: `Transcript:\n${transcript}\n\nQuestion: ${question}`,
+      config: {
+        systemInstruction: `You are answering questions about a video/podcast transcript. Your role is to be a helpful assistant that has "watched" this content.
 
 Guidelines:
 - Answer based ONLY on information in the transcript
@@ -533,17 +550,11 @@ Guidelines:
 - Quote relevant parts when helpful (use quotation marks)
 - Be specific: include names, numbers, timestamps context if mentioned
 - For opinion questions, present what the speaker(s) said, not your own views
-- If multiple speakers discuss the topic, note different perspectives
-
-Transcript:
-${transcript}
-
-Question: ${question}
-
-Answer:`,
+- If multiple speakers discuss the topic, note different perspectives`,
+      },
     })
   );
-  return text;
+  return response.text || "";
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -652,7 +663,7 @@ async function exportQA(
 // 10. CLI interaction loop
 // ────────────────────────────────────────────────────────────────
 
-import { search, select, input } from "@inquirer/prompts";
+import { search, select, input, confirm } from "@inquirer/prompts";
 import { parseArgs } from "util";
 
 async function main() {
@@ -842,13 +853,30 @@ Interactive mode (default):
           { name: "🆕  New question", value: "__new" },
           ...qaRows.map((r) => ({ name: r.question, value: String(r.id) })),
           { name: "📤  Export Q&A", value: "__export" },
+          { name: "🗑️   Delete this session", value: "__delete" },
           { name: "Exit", value: "__exit" },
         ],
-        pageSize: 10,
+        pageSize: 12,
         default: "0",
       });
 
       if (sel === "__exit") break;
+
+      if (sel === "__delete") {
+        const confirmed = await confirm({
+          message: `Delete "${data.title}" and all its Q&A? This cannot be undone.`,
+          default: false,
+        });
+        if (confirmed) {
+          const qaResult = db.run("DELETE FROM qa WHERE content_id = ?", [data.content_id]);
+          const contentResult = db.run("DELETE FROM content WHERE content_id = ?", [data.content_id]);
+          console.log(`\nDeleted "${data.title}"`);
+          console.log(`  - Removed ${qaResult.changes} Q&A entries`);
+          console.log(`  - Removed ${contentResult.changes} content entry\n`);
+          break;
+        }
+        continue;
+      }
 
       if (sel === "__export") {
         try {
