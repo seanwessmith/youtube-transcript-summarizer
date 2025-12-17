@@ -138,7 +138,7 @@ async function fetchOrTranscribe(audioUrl: string): Promise<string> {
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const defaultModel = "gemini-3-pro-preview";
+const defaultModel = "gemini-3-flash-preview";
 const PROVIDERS = {
   SUMMARY_MODEL: process.env.SUMMARY_MODEL || defaultModel,
   QA_MODEL: process.env.QA_MODEL || defaultModel,
