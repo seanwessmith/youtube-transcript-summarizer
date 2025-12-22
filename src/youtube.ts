@@ -1,8 +1,8 @@
-import dotenv from "dotenv";
+import * as dotenv from "dotenv";
 import axios from "axios";
 import { parseStringPromise } from "xml2js";
 import { Database } from "bun:sqlite";
-import path from "path";
+import * as path from "path";
 import { GoogleGenAI } from "@google/genai";
 import { $ } from "bun";
 
@@ -495,7 +495,7 @@ async function summarize(transcript: string): Promise<string> {
     return summarizeChunk(transcript);
   }
 
-  console.log(`Transcript too long, splitting into ${chunks.length} chunks...`);
+  console.log(`Long transcript, splitting into ${chunks.length} chunks...`);
 
   const chunkSummaries: string[] = [];
   for (let i = 0; i < chunks.length; i++) {
@@ -565,11 +565,11 @@ function cosineSimilarity(a: number[], b: number[]): number {
 }
 
 async function getEmbedding(text: string): Promise<number[]> {
-  const { embedding } = await embed({
-    model: google.textEmbeddingModel(PROVIDERS.EMBEDDING_MODEL),
-    value: text,
+  const result = await ai.models.embedContent({
+    model: PROVIDERS.EMBEDDING_MODEL,
+    contents: text,
   });
-  return embedding;
+  return result.embeddings?.[0]?.values ?? [];
 }
 
 async function restoreSession(
