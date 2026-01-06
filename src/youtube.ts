@@ -3,6 +3,7 @@ import axios from "axios";
 import { parseStringPromise } from "xml2js";
 import { Database } from "bun:sqlite";
 import * as path from "path";
+import * as fs from "fs";
 import { GoogleGenAI } from "@google/genai";
 import { $ } from "bun";
 
@@ -11,10 +12,37 @@ const zip = (txt: string): Uint8Array => {
   return Bun.gzipSync(encoded);
 };
 
-const unzip = (txt: string) => {
+const unzip = (txt: Uint8Array) => {
   const dec = new TextDecoder();
   const uncompressed = Bun.gunzipSync(txt);
   return dec.decode(uncompressed);
+};
+
+const isGzip = (bytes: Uint8Array) =>
+  bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+
+const decodeTranscript = (raw: unknown): string => {
+  if (!raw) return "";
+  if (typeof raw === "string") return raw;
+
+  const bytes =
+    raw instanceof Uint8Array
+      ? raw
+      : raw instanceof ArrayBuffer
+        ? new Uint8Array(raw)
+        : raw && typeof raw === "object" && "buffer" in (raw as any)
+          ? new Uint8Array((raw as any).buffer)
+          : null;
+
+  if (!bytes) return String(raw);
+  if (isGzip(bytes)) {
+    try {
+      return unzip(bytes);
+    } catch {
+      // Fall through to plain decode if gzip headers are bad.
+    }
+  }
+  return new TextDecoder().decode(bytes);
 };
 
 // ────────────────────────────────────────────────────────────────
@@ -150,7 +178,55 @@ const PROVIDERS = {
 // ────────────────────────────────────────────────────────────────
 
 async function initDb(): Promise<Database> {
-  const db = new Database("transcripts.sqlite");
+  const resolveDbPath = (): string => {
+    const envPath = process.env.TRANSCRIPTS_DB?.trim();
+    if (envPath) return envPath;
+
+    const home = process.env.HOME || "";
+    const candidates = [
+      path.resolve(process.cwd(), "transcripts.sqlite"),
+      path.resolve(import.meta.dir, "..", "transcripts.sqlite"),
+      home ? path.resolve(home, "transcripts.sqlite") : "",
+      home ? path.resolve(home, "Documents", "transcripts.sqlite") : "",
+    ].filter(Boolean);
+
+    const seen = new Set<string>();
+    const existing = candidates.filter((p) => {
+      if (seen.has(p)) return false;
+      seen.add(p);
+      return fs.existsSync(p);
+    });
+
+    for (const dbPath of existing) {
+      try {
+        const probe = new Database(dbPath);
+        const row = probe
+          .query("SELECT count(*) AS c FROM content")
+          .get() as { c: number } | null;
+        probe.close(true);
+        if ((row?.c ?? 0) > 0) return dbPath;
+      } catch {
+        // Ignore unreadable/non-sqlite files and move on.
+      }
+    }
+
+    return existing[0] || path.resolve(import.meta.dir, "..", "transcripts.sqlite");
+  };
+
+  const dbPath = resolveDbPath();
+  const backupDb = (filePath: string) => {
+    if (!fs.existsSync(filePath)) return;
+    const stat = fs.statSync(filePath);
+    if (stat.size === 0) return;
+    const backupDir = path.resolve(path.dirname(filePath), "db_backups");
+    if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = path.join(backupDir, `transcripts.${ts}.sqlite`);
+    fs.copyFileSync(filePath, backupPath);
+  };
+
+  backupDb(dbPath);
+  const db = new Database(dbPath);
   db.exec(`
     CREATE TABLE IF NOT EXISTS content (
       content_id   TEXT PRIMARY KEY,
@@ -222,7 +298,7 @@ async function getOrCreateTranscript(
       )
       .get(videoId) as ContentData;
     if (existing) {
-      existing.transcript = unzip(existing.transcript); // ← inflate
+      existing.transcript = decodeTranscript(existing.transcript);
       return existing as ContentData;
     }
 
@@ -751,7 +827,7 @@ Interactive mode (default):
     if (values.find) {
       console.log(`Searching for: "${values.find}"...`);
       data = await restoreSession(db, values.find);
-      data.transcript = unzip(data.transcript);
+      data.transcript = decodeTranscript(data.transcript);
       console.log(`\nFound: ${data.title}`);
       if (data.author) console.log(`Author: ${data.author}`);
       console.log(`\nSummary:\n${data.summary}\n`);
@@ -828,7 +904,7 @@ Interactive mode (default):
         .get(pick) as ContentData;
 
       if (!data) throw new Error("Session not found in DB");
-      data.transcript = unzip(data.transcript);
+      data.transcript = decodeTranscript(data.transcript);
     }
 
     console.log(`\nTitle: ${data.title}`);
