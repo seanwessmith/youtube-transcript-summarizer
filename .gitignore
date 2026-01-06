@@ -10,6 +10,9 @@ yarn-error.log*
 lerna-debug.log*
 .pnpm-debug.log*
 tmp
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # Caches
 
@@ -174,3 +177,7 @@ dist
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Local binaries
+src/transcribe
+src/transcribe-mp4

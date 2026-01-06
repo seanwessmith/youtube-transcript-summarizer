@@ -1,6 +1,6 @@
 # YouTube Transcript Summarizer & Q&A Tool
 
-This project retrieves transcripts from YouTube videos, stores them in a local SQLite database, generates a concise summary, and then allows you to ask questions about the transcript. It leverages OpenAI's GPT model for summarization and question-answering.
+This project retrieves transcripts from YouTube videos, stores them in a local SQLite database, generates a concise summary, and then allows you to ask questions about the transcript. The YouTube flow uses Gemini (via `@google/genai`) for summarization and question-answering, while the PDF flow uses OpenAI.
 
 ## Features
 
@@ -13,14 +13,16 @@ This project retrieves transcripts from YouTube videos, stores them in a local S
 ## Requirements
 
 - **Node.js 16+** and **Bun** for running the code.
-- A valid **OpenAI API Key** for using the GPT models.
+- A valid **Gemini API Key** (`GEMINI_API_KEY`) for the YouTube flow.
+- A valid **OpenAI API Key** (`OPENAI_API_KEY`) for the PDF flow.
 - **SQLite** included via `bun:sqlite` (installed by Bun).
 
 ## Dependencies
 
 - [dotenv](https://www.npmjs.com/package/dotenv) for managing environment variables.
 - [youtube-transcript](https://www.npmjs.com/package/youtube-transcript) for fetching YouTube transcripts.
-- [openai](https://www.npmjs.com/package/openai) for accessing OpenAI's GPT models.
+- [@google/genai](https://www.npmjs.com/package/@google/genai) for Gemini models.
+- [openai](https://www.npmjs.com/package/openai) for the PDF summarizer.
 - [bun:sqlite](https://bun.sh/docs/api/sqlite) for local SQLite database interactions.
 
 ## Getting Started
@@ -42,9 +44,10 @@ bun install
 
 ### 3. Set Up Environment Variables
 
-Create a `.env` file in the project root and add your OpenAI API key:
+Create a `.env` file in the project root and add your API keys:
 
 ```env
+GEMINI_API_KEY=your_gemini_api_key_here
 OPENAI_API_KEY=your_openai_api_key_here
 ```
 
@@ -81,7 +84,7 @@ Type `exit` when you're done to close the session.
 ## Tips & Notes
 
 - **Re-using Transcripts:** If you run the script multiple times with the same YouTube URL, it will use the stored transcript and summary, saving time and API calls.
-- **Model Choice:** The code references a model named `gpt-4o`. Make sure you have access to the intended OpenAI model and update the code if necessary.
+- **Model Choice:** The YouTube summarizer uses `gemini-3-flash-preview` by default. Update `SUMMARY_MODEL` / `QA_MODEL` / `EMBEDDING_MODEL` in your environment if needed.
 - **Custom Questions:** Ask specific questions related to the content of the transcript to get the most value out of the Q&A feature.
 - **Error Handling:** If you encounter errors (e.g., no transcript available, invalid URL), the script will print an error message and exit.
 
