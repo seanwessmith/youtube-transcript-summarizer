@@ -1,93 +1,79 @@
-# YouTube Transcript Summarizer & Q&A Tool
+# YouTube Transcript Summarizer
 
-This project retrieves transcripts from YouTube videos, stores them in a local SQLite database, generates a concise summary, and then allows you to ask questions about the transcript. The YouTube flow uses Gemini (via `@google/genai`) for summarization and question-answering, while the PDF flow uses OpenAI.
+This project stores YouTube transcripts in SQLite, generates summaries with OpenAI, and supports transcript Q&A. It prefers downloaded captions and falls back to local Whisper transcription only when captions are unavailable.
 
-## Features
-
-- **Transcript Retrieval:** Automatically fetches transcripts for given YouTube videos.
-- **Database Storage:** Stores transcripts and their summaries in a local SQLite database, avoiding re-fetching for previously processed videos.
-- **Summarization:** Generates a concise summary of the transcript using OpenAI's GPT model.
-- **Q&A Session:** Interactively asks the user for questions related to the transcript and provides answers derived from the transcript context.
-- **CLI Interaction:** Prompts for YouTube URL and interactive Q&A directly in the command-line interface.
+Podcast support has been removed.
 
 ## Requirements
 
-- **Node.js 16+** and **Bun** for running the code.
-- A valid **Gemini API Key** (`GEMINI_API_KEY`) for the YouTube flow.
-- A valid **OpenAI API Key** (`OPENAI_API_KEY`) for the PDF flow.
-- **SQLite** included via `bun:sqlite` (installed by Bun).
+- Bun
+- `yt-dlp`
+- `ffmpeg`
+- `whisper-cli` from `whisper.cpp`
+- `OPENAI_API_KEY` for both the YouTube and PDF flows
 
-## Dependencies
-
-- [dotenv](https://www.npmjs.com/package/dotenv) for managing environment variables.
-- [youtube-transcript](https://www.npmjs.com/package/youtube-transcript) for fetching YouTube transcripts.
-- [@google/genai](https://www.npmjs.com/package/@google/genai) for Gemini models.
-- [openai](https://www.npmjs.com/package/openai) for the PDF summarizer.
-- [bun:sqlite](https://bun.sh/docs/api/sqlite) for local SQLite database interactions.
-
-## Getting Started
-
-### 1. Clone the Repository
-
-```bash
-git clone https://github.com/yourusername/yt-transcript-summarizer.git
-cd yt-transcript-summarizer
-```
-
-### 2. Install Dependencies
-
-Install Node.js dependencies using `bun`:
+## Install
 
 ```bash
 bun install
 ```
 
-### 3. Set Up Environment Variables
+## Environment
 
-Create a `.env` file in the project root and add your API keys:
+Create `.env` in the project root:
 
 ```env
-GEMINI_API_KEY=your_gemini_api_key_here
 OPENAI_API_KEY=your_openai_api_key_here
+WHISPER_CLI_BIN=./whisper.cpp/build/bin/whisper-cli
+WHISPER_MODEL_PATH=./whisper.cpp/models/ggml-base.en.bin
 ```
 
-### 4. Run the Program
+Optional overrides:
 
-Use Bun to run the script:
+- `SUMMARY_MODEL`
+- `QA_MODEL`
+- `EMBEDDING_MODEL`
+- `PDF_SUMMARY_MODEL`
+- `PDF_QA_MODEL`
+- `PDF_EMBEDDING_MODEL`
+- `YTDLP_BIN`
+- `FFMPEG_BIN`
+- `TRANSCRIPTS_DB`
+
+## Commands
+
+```bash
+bun run youtube
+bun run pdf
+bun run typecheck
+```
+
+## YouTube Flow
 
 ```bash
 bun run youtube
 ```
 
-When prompted, enter a YouTube URL:
+The CLI can:
 
-```none
-Please enter the YouTube URL: https://www.youtube.com/watch?v=<VIDEO_ID>
+- start a new YouTube session from a URL
+- reopen saved sessions from SQLite
+- find a saved session semantically with `--find`
+- export stored Q&A to Markdown or JSON
+
+Non-interactive usage:
+
+```bash
+bun run src/youtube.ts --url "https://www.youtube.com/watch?v=<VIDEO_ID>"
+bun run src/youtube.ts --rerun "https://www.youtube.com/watch?v=<VIDEO_ID>"
+bun run src/youtube.ts --find "video about vector databases"
+bun run src/youtube.ts --delete "https://www.youtube.com/watch?v=<VIDEO_ID>"
 ```
 
-The script will:
+## PDF Flow
 
-1. Fetch the transcript.
-2. Summarize it.
-3. Display the summary.
-4. Inform how many transcripts are currently stored in the database.
-
-You can then ask questions about the transcript:
-
-```none
-Question about transcript (or "exit"): What is the main topic of the video?
-Answer: ...
+```bash
+bun run pdf
 ```
 
-Type `exit` when you're done to close the session.
-
-## Tips & Notes
-
-- **Re-using Transcripts:** If you run the script multiple times with the same YouTube URL, it will use the stored transcript and summary, saving time and API calls.
-- **Model Choice:** The YouTube summarizer uses `gemini-3-flash-preview` by default. Update `SUMMARY_MODEL` / `QA_MODEL` / `EMBEDDING_MODEL` in your environment if needed.
-- **Custom Questions:** Ask specific questions related to the content of the transcript to get the most value out of the Q&A feature.
-- **Error Handling:** If you encounter errors (e.g., no transcript available, invalid URL), the script will print an error message and exit.
-
-## License
-
-This project is distributed under the MIT License. See [LICENSE](./LICENSE) for details.
+The PDF tool extracts text, stores it in `pdfs.sqlite`, creates a chunked summary, and answers questions using retrieved excerpts instead of sending the whole document every time.

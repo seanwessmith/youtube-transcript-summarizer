@@ -3,27 +3,20 @@
   "type": "module",
   "packageManager": "bun@1.3.5",
   "scripts": {
-    "compile-cpp": "g++ -std=c++17 src/transcribe.cpp -o src/transcribe",
-    "compile-cpp-mp4": "g++ -std=c++17 src/transcribe-mp4.cpp -o src/transcribe-mp4",
-    "youtube": "bun run compile-cpp && bun run src/youtube.ts",
-    "test-xai": "bun run src/test-xai.ts"
+    "youtube": "bun run src/youtube.ts",
+    "pdf": "bun run src/pdf.ts",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/bun": "1.3.5",
-    "@types/pdf-parse": "^1.1.5",
-    "@types/xml2js": "^0.4.14",
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "@ai-sdk/xai": "^2.0.2",
-    "@google/genai": "^1.34.0",
     "@inquirer/prompts": "^8.1.0",
-    "ai": "^6.0.11",
     "axios": "^1.13.2",
     "dotenv": "^17.2.3",
     "openai": "^6.15.0",
-    "pdf-parse": "^2.4.5",
-    "xml2js": "^0.6.2"
+    "pdf-parse": "^2.4.5"
   },
   "private": true
 }

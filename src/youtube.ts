@@ -1,181 +1,358 @@
-import * as dotenv from "dotenv";
-import axios from "axios";
-import { parseStringPromise } from "xml2js";
 import { Database } from "bun:sqlite";
-import * as path from "path";
-import * as fs from "fs";
-import { GoogleGenAI } from "@google/genai";
 import { $ } from "bun";
+import { confirm, input, search, select } from "@inquirer/prompts";
+import axios from "axios";
+import * as dotenv from "dotenv";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { parseArgs } from "node:util";
+import OpenAI from "openai";
 
-const zip = (txt: string): Uint8Array => {
-  const encoded = new TextEncoder().encode(txt);
-  return Bun.gzipSync(encoded);
+import {
+  buildRagIndex,
+  chunkText,
+  countWords,
+  formatContext,
+  selectRelevantChunks,
+  type RagIndex,
+} from "./rag.ts";
+
+dotenv.config();
+
+const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
+const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
+const WHISPER_CLI_BIN =
+  process.env.WHISPER_CLI_BIN || "./whisper.cpp/build/bin/whisper-cli";
+const WHISPER_MODEL_PATH =
+  process.env.WHISPER_MODEL_PATH || "./whisper.cpp/models/ggml-base.en.bin";
+
+const defaultModel = "gpt-5-mini";
+const PROVIDERS = {
+  SUMMARY_MODEL: process.env.SUMMARY_MODEL || defaultModel,
+  QA_MODEL: process.env.QA_MODEL || defaultModel,
+  EMBEDDING_MODEL: process.env.EMBEDDING_MODEL || "text-embedding-3-small",
 };
 
-const unzip = (txt: Uint8Array) => {
-  const dec = new TextDecoder();
-  const uncompressed = Bun.gunzipSync(txt);
-  return dec.decode(uncompressed);
+const SUMMARY_CHUNK_CONFIG = { maxWords: 15000, overlapWords: 200 };
+const QA_CHUNK_CONFIG = { maxWords: 1200, overlapWords: 150 };
+const QA_CONTEXT_CHUNKS = 4;
+const FIND_MATCH_THRESHOLD = 0.8;
+
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error("OPENAI_API_KEY is required.");
+}
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const zip = (text: string): Uint8Array =>
+  Bun.gzipSync(new TextEncoder().encode(text));
+
+const toUint8Array = (value: Uint8Array | ArrayBuffer): Uint8Array =>
+  value instanceof Uint8Array
+    ? Uint8Array.from(value)
+    : new Uint8Array(value.slice(0));
+
+const unzip = (value: Uint8Array | ArrayBuffer): string => {
+  const uncompressed = Bun.gunzipSync(
+    toUint8Array(value) as unknown as Uint8Array<ArrayBuffer>
+  );
+  return new TextDecoder().decode(Uint8Array.from(uncompressed));
 };
 
 const isGzip = (bytes: Uint8Array) =>
   bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
 
+const decodeBinaryTranscript = (bytes: Uint8Array): string => {
+  const normalized = new Uint8Array(bytes);
+  if (isGzip(normalized)) {
+    try {
+      return unzip(normalized);
+    } catch {
+      // Fall back to plain decoding if the stored bytes are malformed.
+    }
+  }
+  return new TextDecoder().decode(normalized);
+};
+
 const decodeTranscript = (raw: unknown): string => {
   if (!raw) return "";
   if (typeof raw === "string") return raw;
-
-  const bytes =
-    raw instanceof Uint8Array
-      ? raw
-      : raw instanceof ArrayBuffer
-        ? new Uint8Array(raw)
-        : raw && typeof raw === "object" && "buffer" in (raw as any)
-          ? new Uint8Array((raw as any).buffer)
-          : null;
-
-  if (!bytes) return String(raw);
-  if (isGzip(bytes)) {
-    try {
-      return unzip(bytes);
-    } catch {
-      // Fall through to plain decode if gzip headers are bad.
-    }
+  if (raw instanceof Uint8Array) return decodeBinaryTranscript(raw);
+  if (raw instanceof ArrayBuffer) return decodeBinaryTranscript(new Uint8Array(raw));
+  if (ArrayBuffer.isView(raw)) {
+    return decodeBinaryTranscript(
+      new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
+    );
   }
-  return new TextDecoder().decode(bytes);
+  return String(raw);
 };
 
-// ────────────────────────────────────────────────────────────────
-// 1. Environment & util setup
-// ────────────────────────────────────────────────────────────────
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-dotenv.config();
+const createTempDir = (prefix: string): string =>
+  fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 
-const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp"; // path to yt-dlp binary
-const TRANSCRIBE_BIN = process.env.TRANSCRIBE_BIN || "./src/transcribe";
-const WHISPER_MODEL_PATH =
-  process.env.WHISPER_MODEL_PATH || "./whisper.cpp/models/ggml-base.en.bin";
+const removeDir = (dirPath: string) => {
+  fs.rmSync(dirPath, { recursive: true, force: true });
+};
 
-// ────────────────────────────────────────────────────────────────
-// 2. Caption retrieval (uses yt-dlp directly – no Invidious needed)
-// ────────────────────────────────────────────────────────────────
+const listMatchingFiles = (
+  dirPath: string,
+  predicate: (fileName: string) => boolean
+): string[] =>
+  fs
+    .readdirSync(dirPath)
+    .filter(predicate)
+    .sort((a, b) => a.localeCompare(b))
+    .map((fileName) => path.join(dirPath, fileName));
+
+const readProcessOutput = (value: unknown): string => {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+  if (value instanceof ArrayBuffer) {
+    return new TextDecoder().decode(new Uint8Array(value));
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new TextDecoder().decode(
+      new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+    );
+  }
+  return String(value);
+};
+
+const ensureLocalFile = (filePath: string, description: string) => {
+  if (!filePath.includes(path.sep)) return;
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`${description} not found: ${filePath}`);
+  }
+};
+
+const normalizeTranscriptText = (text: string): string =>
+  text.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
+
+const extractVttText = (raw: string): string =>
+  raw
+    .split(/\r?\n/)
+    .filter(
+      (line) =>
+        line &&
+        !/^WEBVTT/.test(line) &&
+        !/^NOTE/.test(line) &&
+        !/^\d+$/.test(line) &&
+        !/-->/.test(line)
+    )
+    .join(" ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const getVideoId = (input: string): string => {
+  const trimmed = input.trim();
+  if (/^[A-Za-z0-9_-]{11}$/.test(trimmed)) return trimmed;
+
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+
+  try {
+    const url = new URL(withProtocol);
+
+    if (url.hostname === "youtu.be") {
+      const candidate = url.pathname.split("/").filter(Boolean)[0] ?? "";
+      return /^[A-Za-z0-9_-]{11}$/.test(candidate) ? candidate : "";
+    }
+
+    if (
+      url.hostname === "youtube.com" ||
+      url.hostname === "www.youtube.com" ||
+      url.hostname === "m.youtube.com"
+    ) {
+      const watchId = url.searchParams.get("v");
+      if (watchId && /^[A-Za-z0-9_-]{11}$/.test(watchId)) return watchId;
+
+      const parts = url.pathname.split("/").filter(Boolean);
+      const marker = parts.findIndex((part) =>
+        ["embed", "shorts", "live"].includes(part)
+      );
+      if (marker >= 0) {
+        const candidate = parts[marker + 1] ?? "";
+        return /^[A-Za-z0-9_-]{11}$/.test(candidate) ? candidate : "";
+      }
+    }
+  } catch {
+    // Fall back to the regex below.
+  }
+
+  const fallbackMatch = trimmed.match(
+    /(?:v=|youtu\.be\/|\/embed\/|\/shorts\/|\/live\/)([A-Za-z0-9_-]{11})/
+  );
+  return fallbackMatch?.[1] ?? "";
+};
+
+async function fetchYoutubeTitle(videoId: string): Promise<string> {
+  try {
+    const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+    const { data } = await axios.get<{ title?: string }>(url);
+    return data.title?.trim() || `YouTube video ${videoId}`;
+  } catch {
+    return `YouTube video ${videoId}`;
+  }
+}
 
 async function fetchCaptionsWithYtDlp(
   videoUrl: string,
   videoId: string
 ): Promise<string | null> {
-  const tmpDir = "./tmp";
-  const vttPath = path.join(tmpDir, `${videoId}.en.vtt`);
-
-  // Create tmp directory
-  await $`mkdir -p ${tmpDir}`.quiet();
+  const tmpDir = createTempDir("yt-captions-");
+  const outputTemplate = path.join(tmpDir, "%(id)s.%(ext)s");
 
   try {
-    // Run yt-dlp to download captions
-    await $`${YTDLP_BIN} \
-      --write-auto-sub \
-      --sub-lang en \
-      --sub-format vtt \
-      --skip-download \
-      -o ${path.join(tmpDir, "%(id)s.%(ext)s")} \
-      ${videoUrl}`.quiet();
+    await $`${YTDLP_BIN} --no-warnings --skip-download --write-sub --write-auto-sub --sub-lang en --sub-format vtt -o ${outputTemplate} ${videoUrl}`.quiet();
 
-    // Read and process the VTT file
-    const raw = await Bun.file(vttPath).text();
+    const candidates = listMatchingFiles(
+      tmpDir,
+      (fileName) => fileName.startsWith(videoId) && fileName.endsWith(".vtt")
+    ).sort((a, b) => {
+      const rank = (filePath: string) => {
+        const base = path.basename(filePath);
+        if (base.includes(".en.")) return 0;
+        if (base.includes(".en-")) return 1;
+        return 2;
+      };
+      return rank(a) - rank(b) || a.localeCompare(b);
+    });
 
-    // Convert VTT to plain text
-    const transcript = raw
-      .split(/\r?\n/)
-      .filter(
-        (line) =>
-          line &&
-          !/^WEBVTT/.test(line) &&
-          !/^\d+$/.test(line) && // cue index lines
-          !/-->/.test(line) // timestamp lines
-      )
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
+    if (candidates.length === 0) return null;
 
+    const raw = fs.readFileSync(candidates[0], "utf8");
+    const transcript = extractVttText(raw);
     return transcript || null;
-  } catch (err: any) {
-    // Check for specific YouTube errors
-    if (err?.stderr) {
-      const stderr = err.stderr.toString();
-      if (stderr.includes("live event will begin")) {
-        throw new Error(
-          "Cannot process upcoming live streams. Please wait until the stream has started and finished."
-        );
-      }
-      if (stderr.includes("This video is unavailable")) {
-        throw new Error("Video is unavailable or private.");
-      }
+  } catch (error) {
+    const stderr = readProcessOutput((error as { stderr?: unknown })?.stderr);
+    if (stderr.includes("live event will begin")) {
+      throw new Error(
+        "Cannot process upcoming live streams. Wait until the stream has finished."
+      );
     }
-    console.warn("Failed to fetch captions, will try transcription fallback");
+    if (stderr.includes("This video is unavailable")) {
+      throw new Error("Video is unavailable or private.");
+    }
+    console.warn("Captions unavailable, falling back to Whisper.");
     return null;
+  } finally {
+    removeDir(tmpDir);
   }
 }
 
-// ────────────────────────────────────────────────────────────────
-// 3. Cleanup & YouTube helpers
-// ────────────────────────────────────────────────────────────────
+async function transcribeYoutubeWithWhisper(videoUrl: string): Promise<string> {
+  ensureLocalFile(WHISPER_CLI_BIN, "Whisper CLI binary");
+  ensureLocalFile(WHISPER_MODEL_PATH, "Whisper model");
 
-async function cleanupTmpFiles(videoId: string): Promise<void> {
-  const tmpDir = "./tmp";
+  const tmpDir = createTempDir("yt-transcribe-");
+  const audioTemplate = path.join(tmpDir, "audio.%(ext)s");
+  const chunkTemplate = path.join(tmpDir, "chunk_%03d.mp3");
+
   try {
-    const files = await Array.fromAsync(new Bun.Glob(`${videoId}*`).scan(tmpDir));
-    for (const file of files) {
-      await Bun.file(path.join(tmpDir, file)).delete();
-    }
-  } catch {
-    // Ignore cleanup errors
-  }
-}
+    await $`${YTDLP_BIN} --no-warnings -x --audio-format mp3 --audio-quality 128 -o ${audioTemplate} ${videoUrl}`.quiet();
 
-async function fetchYoutubeTitleOEmbed(videoId: string): Promise<string> {
-  const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
-  const { data } = await axios.get<{ title: string }>(url);
-  return data.title;
-}
-
-const getVideoId = (url: string) => {
-  const match = url.match(/(?:v=|\/)([A-Za-z0-9_-]{11})/);
-  return match?.[1] ?? "";
-};
-
-// ────────────────────────────────────────────────────────────────
-// 4. Whisper fallback (same as before)
-// ────────────────────────────────────────────────────────────────
-
-async function fetchOrTranscribe(audioUrl: string): Promise<string> {
-  try {
-    const { stdout } =
-      await $`${TRANSCRIBE_BIN} ${audioUrl} ${WHISPER_MODEL_PATH}`;
-    return stdout.toString().trim();
-  } catch (err) {
-    console.error("Transcription failed:", err);
-    throw new Error(
-      `Transcriber failed: ${err instanceof Error ? err.message : String(err)}`
+    const audioFiles = listMatchingFiles(
+      tmpDir,
+      (fileName) => fileName.startsWith("audio.") && fileName.endsWith(".mp3")
     );
+    const audioFile = audioFiles[0];
+
+    if (!audioFile) {
+      throw new Error("yt-dlp did not produce an MP3 file for transcription.");
+    }
+
+    await $`${FFMPEG_BIN} -hide_banner -loglevel error -i ${audioFile} -f segment -segment_time 600 -c copy ${chunkTemplate}`.quiet();
+
+    const chunkFiles = listMatchingFiles(
+      tmpDir,
+      (fileName) => fileName.startsWith("chunk_") && fileName.endsWith(".mp3")
+    );
+
+    if (chunkFiles.length === 0) {
+      throw new Error("ffmpeg did not produce any audio chunks.");
+    }
+
+    const transcriptParts: string[] = [];
+
+    for (let index = 0; index < chunkFiles.length; index += 1) {
+      const chunkFile = chunkFiles[index];
+      const baseName = path.parse(chunkFile).name;
+      const wavPath = path.join(tmpDir, `${baseName}.wav`);
+      const outputBase = path.join(tmpDir, baseName);
+
+      console.log(`Transcribing chunk ${index + 1}/${chunkFiles.length}...`);
+
+      await $`${FFMPEG_BIN} -hide_banner -loglevel error -i ${chunkFile} -ar 16000 -ac 1 ${wavPath}`.quiet();
+      await $`${WHISPER_CLI_BIN} --no-prints --no-timestamps --output-txt --output-file ${outputBase} --language en --model ${WHISPER_MODEL_PATH} --file ${wavPath}`.quiet();
+
+      const transcriptPath = `${outputBase}.txt`;
+      if (!fs.existsSync(transcriptPath)) {
+        throw new Error(`Whisper did not produce ${path.basename(transcriptPath)}.`);
+      }
+
+      const chunkTranscript = normalizeTranscriptText(
+        fs.readFileSync(transcriptPath, "utf8")
+      );
+      if (chunkTranscript) transcriptParts.push(chunkTranscript);
+    }
+
+    const transcript = transcriptParts.join("\n\n").trim();
+    if (!transcript) {
+      throw new Error("Whisper returned an empty transcript.");
+    }
+
+    return transcript;
+  } finally {
+    removeDir(tmpDir);
   }
 }
 
-// ────────────────────────────────────────────────────────────────
-// 5. LLM & embedding setup (using Gemini)
-// ────────────────────────────────────────────────────────────────
+interface ContentData {
+  content_id: string;
+  content_type: "youtube";
+  title: string;
+  transcript: string;
+  summary: string;
+  created_at?: string;
+}
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+interface StoredContentRow {
+  content_id: string;
+  content_type: string;
+  title: string;
+  transcript: unknown;
+  summary: string;
+  created_at?: string;
+}
 
-const defaultModel = "gemini-3-flash-preview";
-const PROVIDERS = {
-  SUMMARY_MODEL: process.env.SUMMARY_MODEL || defaultModel,
-  QA_MODEL: process.env.QA_MODEL || defaultModel,
-  EMBEDDING_MODEL: process.env.EMBEDDING_MODEL || "text-embedding-004",
+interface QARow {
+  id: number;
+  question: string;
+  answer: string;
+  created_at?: string;
+}
+
+interface TranscriptOptions {
+  forceRefresh?: boolean;
+}
+
+const toContentData = (row: StoredContentRow | null): ContentData | null => {
+  if (!row) return null;
+  return {
+    content_id: row.content_id,
+    content_type: "youtube",
+    title: row.title || `YouTube video ${row.content_id}`,
+    transcript: decodeTranscript(row.transcript),
+    summary: row.summary || "",
+    created_at: row.created_at,
+  };
 };
-
-// ────────────────────────────────────────────────────────────────
-// 6. Database setup (unchanged)
-// ────────────────────────────────────────────────────────────────
 
 async function initDb(): Promise<Database> {
   const resolveDbPath = (): string => {
@@ -191,10 +368,10 @@ async function initDb(): Promise<Database> {
     ].filter(Boolean);
 
     const seen = new Set<string>();
-    const existing = candidates.filter((p) => {
-      if (seen.has(p)) return false;
-      seen.add(p);
-      return fs.existsSync(p);
+    const existing = candidates.filter((candidate) => {
+      if (seen.has(candidate)) return false;
+      seen.add(candidate);
+      return fs.existsSync(candidate);
     });
 
     for (const dbPath of existing) {
@@ -206,7 +383,7 @@ async function initDb(): Promise<Database> {
         probe.close(true);
         if ((row?.c ?? 0) > 0) return dbPath;
       } catch {
-        // Ignore unreadable/non-sqlite files and move on.
+        // Ignore non-SQLite files and continue.
       }
     }
 
@@ -214,20 +391,23 @@ async function initDb(): Promise<Database> {
   };
 
   const dbPath = resolveDbPath();
-  const backupDb = (filePath: string) => {
-    if (!fs.existsSync(filePath)) return;
-    const stat = fs.statSync(filePath);
-    if (stat.size === 0) return;
-    const backupDir = path.resolve(path.dirname(filePath), "db_backups");
-    if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupPath = path.join(backupDir, `transcripts.${ts}.sqlite`);
-    fs.copyFileSync(filePath, backupPath);
-  };
 
-  backupDb(dbPath);
+  if (fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0) {
+    const backupDir = path.resolve(path.dirname(dbPath), "db_backups");
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    fs.copyFileSync(
+      dbPath,
+      path.join(backupDir, `transcripts.${timestamp}.sqlite`)
+    );
+  }
+
   const db = new Database(dbPath);
   db.exec(`
+    PRAGMA foreign_keys = ON;
+
     CREATE TABLE IF NOT EXISTS content (
       content_id   TEXT PRIMARY KEY,
       content_type TEXT NOT NULL,
@@ -248,17 +428,10 @@ async function initDb(): Promise<Database> {
       FOREIGN KEY (content_id) REFERENCES content(content_id)
     );
   `);
-  /* turn on incremental auto-vacuum (first run triggers a VACUUM) */
-  // db.exec(`
-  //   PRAGMA auto_vacuum = INCREMENTAL;
-  //   PRAGMA journal_mode = WAL;
-  //   VACUUM;
-  // `);
 
   return db;
 }
 
-/* helper to persist Q&A */
 function storeQA(
   db: Database,
   contentId: string,
@@ -272,270 +445,134 @@ function storeQA(
   ]);
 }
 
-interface ContentData {
-  content_id: string;
-  content_type: "youtube" | "apple_podcast";
-  title: string;
-  author: string;
-  audio_url?: string;
-  transcript: string;
-  summary: string;
-}
-
-// ────────────────────────────────────────────────────────────────
-// 7. Transcript acquisition (now uses yt-dlp first)
-// ────────────────────────────────────────────────────────────────
-
 async function getOrCreateTranscript(
   db: Database,
-  url: string
+  url: string,
+  options: TranscriptOptions = {}
 ): Promise<ContentData> {
   const videoId = getVideoId(url);
-  if (videoId) {
-    const existing = db
+  if (!videoId) {
+    throw new Error("Only YouTube URLs are supported.");
+  }
+
+  const existing = toContentData(
+    db
       .query(
         "SELECT * FROM content WHERE content_id = ? AND content_type = 'youtube'"
       )
-      .get(videoId) as ContentData;
-    if (existing) {
-      existing.transcript = decodeTranscript(existing.transcript);
-      return existing as ContentData;
-    }
+      .get(videoId) as StoredContentRow | null
+  );
 
-    // Fetch title in parallel with transcript
-    const titlePromise = fetchYoutubeTitleOEmbed(videoId);
+  if (existing && !options.forceRefresh) return existing;
 
-    // 1️⃣ Try yt-dlp captions
-    let transcript = await fetchCaptionsWithYtDlp(url, videoId);
+  const titlePromise = fetchYoutubeTitle(videoId);
 
-    // 2️⃣ Fallback to Whisper transcription
-    if (!transcript) transcript = await fetchOrTranscribe(url);
-
-    // Cleanup tmp VTT file
-    await cleanupTmpFiles(videoId);
-
-    const title = await titlePromise;
-    const summary = await summarize(transcript);
-    const zipped = zip(transcript);
-    db.run(
-      `INSERT INTO content (content_id, content_type, title, author, transcript, summary) VALUES (?, ?, ?, ?, ?, ?)`,
-      [videoId, "youtube", title, "", zipped, summary]
-    );
-    console.log("Transcript stored for", videoId);
-    return {
-      content_id: videoId,
-      content_type: "youtube",
-      title,
-      author: "",
-      transcript,
-      summary,
-    };
+  let transcript = await fetchCaptionsWithYtDlp(url, videoId);
+  if (!transcript) {
+    transcript = await transcribeYoutubeWithWhisper(url);
   }
 
-  // ────────────────────────────────────────────────────────────
-  //  Apple Podcasts path (unchanged)
-  // ────────────────────────────────────────────────────────────
+  const title = await titlePromise;
+  const summary = await summarizeTranscript(transcript);
 
-  const parsePodcastUrl = async (
-    url: string
-  ): Promise<{
-    podcastId: string;
-    episodeId: string;
-    title: string;
-    author: string;
-    audioUrl: string;
-  } | null> => {
-    const podcastMatch = url.match(/\/id(\d+)/);
-    if (!podcastMatch) return null;
-    const podcastId = podcastMatch[1];
-    const episodeId = url.match(/[?&]i=(\d+)/)?.[1] ?? "";
-
-    const lookup = await axios.get(
-      `https://itunes.apple.com/lookup?id=${podcastId}&entity=podcast`
+  if (existing) {
+    const qaResult = db.run("DELETE FROM qa WHERE content_id = ?", [videoId]);
+    db.run(
+      `UPDATE content
+       SET title = ?, author = ?, audio_url = ?, transcript = ?, summary = ?, created_at = CURRENT_TIMESTAMP
+       WHERE content_id = ? AND content_type = 'youtube'`,
+      [title, "", "", zip(transcript), summary, videoId]
     );
-    const info = lookup.data.results?.[0];
-    if (!info?.feedUrl) return null;
+    console.log(
+      `Re-ran ${videoId} and cleared ${qaResult.changes} cached Q&A entr${qaResult.changes === 1 ? "y" : "ies"}.`
+    );
+  } else {
+    db.run(
+      `INSERT INTO content (content_id, content_type, title, author, audio_url, transcript, summary)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [videoId, "youtube", title, "", "", zip(transcript), summary]
+    );
+    console.log("Transcript stored for", videoId);
+  }
 
-    const feed = await axios.get(info.feedUrl);
-    const channel = (await parseStringPromise(feed.data)).rss.channel[0];
-    const author = channel.author?.[0] ?? channel["itunes:author"]?.[0] ?? "";
-
-    const findEpisode = (items: any[]) =>
-      items.find((it) => it.guid?.[0]?._?.includes(episodeId)) || items[0];
-
-    const episode = findEpisode(channel.item || []);
-    const title = episode.title[0];
-    const enclosure = episode.enclosure?.[0]?.$?.url || "";
-
-    return {
-      podcastId,
-      episodeId: episodeId || title,
-      title,
-      author,
-      audioUrl: enclosure,
-    };
-  };
-
-  const info = await parsePodcastUrl(url);
-  if (!info) throw new Error("Invalid podcast URL");
-
-  const contentId = `podcast_${info.podcastId}_episode_${info.episodeId}`;
-  const existing = db
-    .query(
-      "SELECT * FROM content WHERE content_id = ? AND content_type = 'apple_podcast'"
-    )
-    .get(contentId) as ContentData;
-  if (existing) return existing;
-
-  // Try RSS transcript first
-  const transcriptFromRSS = async (
-    podcastId: string,
-    episodeId: string
-  ): Promise<string | null> => {
-    try {
-      const lookupResponse = await axios.get(
-        `https://itunes.apple.com/lookup?id=${podcastId}&entity=podcast`
-      );
-      if (!lookupResponse.data?.results?.[0]?.feedUrl) return null;
-
-      const feedUrl = lookupResponse.data.results[0].feedUrl;
-      const feedResponse = await axios.get(feedUrl);
-      const parsedFeed = await parseStringPromise(feedResponse.data);
-
-      const channel = parsedFeed.rss.channel[0];
-      const episode = channel.item?.find((item: any) => {
-        const guid = item.guid?.[0]?._;
-        return guid && guid.includes(episodeId);
-      });
-
-      if (episode && episode["podcast:transcript"]) {
-        const transcriptUrl = episode["podcast:transcript"][0].$.url;
-        if (transcriptUrl) {
-          const transcriptResponse = await axios.get(transcriptUrl);
-          return transcriptResponse.data;
-        }
-      }
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
-  let transcript = await transcriptFromRSS(info.podcastId, info.episodeId);
-  if (!transcript) transcript = await fetchOrTranscribe(info.audioUrl);
-
-  const summary = await summarize(transcript);
-  db.run(
-    `INSERT INTO content
-   (content_id, content_type, title, author, audio_url, transcript, summary)
-   VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [
-      contentId,
-      "apple_podcast",
-      info.title,
-      info.author,
-      info.audioUrl,
-      zip(transcript), // gzip
-      summary,
-    ]
-  );
   return {
-    content_id: contentId,
-    content_type: "apple_podcast",
-    ...info,
+    content_id: videoId,
+    content_type: "youtube",
+    title,
     transcript,
     summary,
   };
 }
 
-// ────────────────────────────────────────────────────────────────
-// 8. Summarisation & QA using Gemini native API
-// ────────────────────────────────────────────────────────────────
-
-// Retry helper with exponential backoff
 async function retryWithBackoff<T>(
   fn: () => Promise<T>,
   maxRetries = 6,
-  initialDelay = 5000
+  initialDelayMs = 5000
 ): Promise<T> {
-  let lastError: Error | undefined;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
     try {
       return await fn();
-    } catch (err: any) {
-      lastError = err;
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      const isRateLimit =
+        message.includes("Too Many Requests") ||
+        message.includes("429") ||
+        (error as { status?: number; statusCode?: number })?.status === 429 ||
+        (error as { status?: number; statusCode?: number })?.statusCode === 429;
+      const isTimeout =
+        message.toLowerCase().includes("timeout") ||
+        message.includes("AbortError");
 
-      // Check if this is a retryable error
-      const errorMessage = err?.message || "";
-      const isRateLimitError =
-        errorMessage.includes("Too Many Requests") ||
-        errorMessage.includes("429") ||
-        errorMessage.includes("Rate limit") ||
-        err?.status === 429 ||
-        err?.statusCode === 429;
-
-      const isTimeoutError =
-        errorMessage.includes("timeout") ||
-        errorMessage.includes("TimeoutError") ||
-        errorMessage.includes("aborted") ||
-        err?.name === "TimeoutError" ||
-        err?.name === "AbortError";
-
-      const isRetryable = isRateLimitError || isTimeoutError;
-
-      if (!isRetryable || attempt === maxRetries - 1) {
-        // Not a retryable error or final attempt - throw it
-        const errorDetails = err?.cause?.message || err?.message || String(err);
-        throw new Error(`Gemini API Error: ${errorDetails}`);
+      if ((!isRateLimit && !isTimeout) || attempt === maxRetries - 1) {
+        throw new Error(`OpenAI API Error: ${message}`);
       }
 
-      // Calculate delay with jitter to avoid thundering herd
-      const baseDelay = initialDelay * Math.pow(2, attempt);
-      const jitter = Math.random() * 1000;
-      const delay = baseDelay + jitter;
-
-      const reason = isTimeoutError ? "Timeout" : "Rate limited";
+      const backoffMs = initialDelayMs * 2 ** attempt + Math.random() * 1000;
       console.log(
-        `${reason}. Waiting ${Math.round(delay / 1000)}s before retry ${attempt + 1}/${maxRetries}...`
+        `${isTimeout ? "Timeout" : "Rate limited"}. Waiting ${Math.round(
+          backoffMs / 1000
+        )}s before retry ${attempt + 1}/${maxRetries}...`
       );
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      await sleep(backoffMs);
     }
   }
-  throw lastError || new Error("Retry failed");
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-const MAX_WORDS_PER_CHUNK = 15000;
-const CHUNK_OVERLAP_WORDS = 200;
-
-function chunkTranscript(transcript: string): string[] {
-  const words = transcript.split(/\s+/);
-  if (words.length <= MAX_WORDS_PER_CHUNK) {
-    return [transcript];
-  }
-
-  const chunks: string[] = [];
-  let start = 0;
-  while (start < words.length) {
-    const end = Math.min(start + MAX_WORDS_PER_CHUNK, words.length);
-    chunks.push(words.slice(start, end).join(" "));
-    // Break if we've reached the end
-    if (end >= words.length) break;
-    // Move forward with overlap for context
-    start = end - CHUNK_OVERLAP_WORDS;
-  }
-  return chunks;
-}
-
-async function summarizeChunk(chunk: string, chunkNum?: number, totalChunks?: number): Promise<string> {
-  const chunkInfo = totalChunks && totalChunks > 1 ? ` (part ${chunkNum} of ${totalChunks})` : "";
-  const wordCount = chunk.split(/\s+/).length;
-  console.log(`Sending ${wordCount} words to ${PROVIDERS.SUMMARY_MODEL}...`);
+async function completeChat(
+  model: string,
+  system: string,
+  prompt: string
+): Promise<string> {
   const response = await retryWithBackoff(() =>
-    ai.models.generateContent({
-      model: PROVIDERS.SUMMARY_MODEL,
-      contents: `Analyze this transcript:\n\n${chunk}`,
-      config: {
-        systemInstruction: `You are an expert content analyst specializing in extracting insights from video and podcast transcripts${chunkInfo}.
+    openai.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: prompt },
+      ],
+    })
+  );
+
+  return response.choices[0]?.message?.content?.trim() || "";
+}
+
+async function summarizeChunk(
+  chunk: string,
+  chunkNum?: number,
+  totalChunks?: number
+): Promise<string> {
+  const chunkInfo =
+    totalChunks && totalChunks > 1 ? ` (part ${chunkNum} of ${totalChunks})` : "";
+  console.log(`Sending ${countWords(chunk)} words to ${PROVIDERS.SUMMARY_MODEL}...`);
+
+  return completeChat(
+    PROVIDERS.SUMMARY_MODEL,
+    `You are an expert content analyst specializing in extracting insights from YouTube transcripts${chunkInfo}.
 
 Analyze the transcript and provide:
 
@@ -545,48 +582,43 @@ Analyze the transcript and provide:
 - Note any contrarian or surprising perspectives
 
 ## Notable Quotes
-- Include 1-2 memorable or impactful direct quotes (if any stand out)
+- Include 1-2 memorable or impactful direct quotes if any stand out
 
 ## People & References
 - List any people, books, papers, companies, or tools mentioned
 
 ## Action Items / Takeaways
 - Practical advice or recommendations given
-- Things the viewer/listener should consider doing
+- Things the viewer should consider doing
 
 Be specific and factual. Preserve technical terms and proper nouns exactly as used.`,
-      },
-    })
+    `Analyze this transcript:\n\n${chunk}`
   );
-  return response.text || "";
 }
 
-async function summarize(transcript: string): Promise<string> {
-  const wordCount = transcript.split(/\s+/).length;
-  console.log(`summarizing ${wordCount} word transcript with ${defaultModel}`);
+async function summarizeTranscript(transcript: string): Promise<string> {
+  const chunks = chunkText(transcript, SUMMARY_CHUNK_CONFIG);
+  console.log(
+    `Summarizing ${countWords(transcript)} words with ${PROVIDERS.SUMMARY_MODEL}...`
+  );
 
-  const chunks = chunkTranscript(transcript);
-
-  if (chunks.length === 1) {
+  if (chunks.length <= 1) {
     return summarizeChunk(transcript);
   }
 
   console.log(`Long transcript, splitting into ${chunks.length} chunks...`);
-
   const chunkSummaries: string[] = [];
-  for (let i = 0; i < chunks.length; i++) {
-    console.log(`Summarizing chunk ${i + 1}/${chunks.length}...`);
-    const summary = await summarizeChunk(chunks[i], i + 1, chunks.length);
-    chunkSummaries.push(summary);
+
+  for (const chunk of chunks) {
+    console.log(`Summarizing chunk ${chunk.index + 1}/${chunks.length}...`);
+    chunkSummaries.push(
+      await summarizeChunk(chunk.text, chunk.index + 1, chunks.length)
+    );
   }
 
-  console.log("Combining chunk summaries into final summary...");
-  const response = await retryWithBackoff(() =>
-    ai.models.generateContent({
-      model: PROVIDERS.SUMMARY_MODEL,
-      contents: `Synthesize these part analyses into a final summary:\n\n${chunkSummaries.map((s, i) => `=== Part ${i + 1} ===\n${s}`).join("\n\n")}`,
-      config: {
-        systemInstruction: `You are an expert content analyst. You will receive analyses from different parts of a long transcript.
+  return completeChat(
+    PROVIDERS.SUMMARY_MODEL,
+    `You are an expert content analyst. You will receive analyses from different parts of a long YouTube transcript.
 
 Synthesize them into a single cohesive summary following this structure:
 
@@ -603,80 +635,103 @@ Synthesize them into a single cohesive summary following this structure:
 
 ## Action Items / Takeaways
 - Combined practical advice and recommendations
-- Remove duplicates, keep the most actionable items
+- Remove duplicates and keep the most actionable items
 
 Remove redundancy from overlapping sections. Preserve specificity and technical accuracy.`,
-      },
-    })
+    `Synthesize these part analyses into a final summary:\n\n${chunkSummaries
+      .map((summary, index) => `=== Part ${index + 1} ===\n${summary}`)
+      .join("\n\n")}`
   );
-  return response.text || "";
-}
-
-async function answer(transcript: string, question: string): Promise<string> {
-  const response = await retryWithBackoff(() =>
-    ai.models.generateContent({
-      model: PROVIDERS.QA_MODEL,
-      contents: `Transcript:\n${transcript}\n\nQuestion: ${question}`,
-      config: {
-        systemInstruction: `You are answering questions about a video/podcast transcript. Your role is to be a helpful assistant that has "watched" this content.
-
-Guidelines:
-- Answer based ONLY on information in the transcript
-- If the answer isn't in the transcript, say so clearly
-- Quote relevant parts when helpful (use quotation marks)
-- Be specific: include names, numbers, timestamps context if mentioned
-- For opinion questions, present what the speaker(s) said, not your own views
-- If multiple speakers discuss the topic, note different perspectives`,
-      },
-    })
-  );
-  return response.text || "";
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  const dot = a.reduce((s, v, i) => s + v * b[i], 0);
-  const magA = Math.hypot(...a);
-  const magB = Math.hypot(...b);
-  return magA && magB ? dot / (magA * magB) : 0;
 }
 
 async function getEmbedding(text: string): Promise<number[]> {
-  const result = await ai.models.embedContent({
-    model: PROVIDERS.EMBEDDING_MODEL,
-    contents: text,
-  });
-  return result.embeddings?.[0]?.values ?? [];
+  const result = await retryWithBackoff(() =>
+    openai.embeddings.create({
+      model: PROVIDERS.EMBEDDING_MODEL,
+      input: text,
+    })
+  );
+  return result.data[0]?.embedding ?? [];
+}
+
+async function buildQaIndex(transcript: string): Promise<RagIndex> {
+  return buildRagIndex(transcript, getEmbedding, QA_CHUNK_CONFIG);
+}
+
+async function answerQuestion(index: RagIndex, question: string): Promise<string> {
+  const contextChunks = await selectRelevantChunks(
+    index,
+    question,
+    getEmbedding,
+    QA_CONTEXT_CHUNKS
+  );
+  const context = formatContext(contextChunks);
+
+  return completeChat(
+    PROVIDERS.QA_MODEL,
+    `You answer questions about a YouTube transcript.
+
+Rules:
+- Use only the supplied transcript excerpts
+- If the answer is not supported by the excerpts, say so clearly
+- Quote or reference the most relevant excerpt when helpful
+- Be concise but specific`,
+    `Question: ${question}\n\nTranscript excerpts:\n${context}`
+  );
 }
 
 async function restoreSession(
   db: Database,
   narrative: string
 ): Promise<ContentData> {
-  const rows = db.query("SELECT * FROM content").all() as ContentData[];
-  if (rows.length === 0) throw new Error("No sessions saved");
+  const rows = (
+    db
+      .query("SELECT * FROM content WHERE content_type = 'youtube'")
+      .all() as StoredContentRow[]
+  )
+    .map((row) => toContentData(row))
+    .filter((row): row is ContentData => Boolean(row));
 
-  const navEmb = await getEmbedding(narrative);
-  const sims = await Promise.all(rows.map((r) => getEmbedding(r.summary)));
+  if (rows.length === 0) throw new Error("No YouTube sessions saved.");
 
-  let best = { idx: -1, score: -Infinity };
-  sims.forEach((emb: number[], i: number) => {
-    const sim = cosineSimilarity(navEmb, emb);
-    if (sim > best.score) best = { idx: i, score: sim };
+  const queryEmbedding = await getEmbedding(narrative);
+  const summaryEmbeddings = await Promise.all(
+    rows.map((row) => getEmbedding(row.summary || row.title))
+  );
+
+  let bestIndex = -1;
+  let bestScore = -Infinity;
+
+  summaryEmbeddings.forEach((embedding, index) => {
+    const score = embedding.length === 0 ? 0 : cosineSimilarity(queryEmbedding, embedding);
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
   });
 
-  if (best.score < 0.8) throw new Error("No close match found");
-  return rows[best.idx];
+  if (bestIndex === -1 || bestScore < FIND_MATCH_THRESHOLD) {
+    throw new Error("No close match found.");
+  }
+
+  return rows[bestIndex];
 }
 
-// ────────────────────────────────────────────────────────────────
-// 9. Export functions
-// ────────────────────────────────────────────────────────────────
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length === 0 || b.length === 0 || a.length !== b.length) return 0;
 
-interface QARow {
-  id: number;
-  question: string;
-  answer: string;
-  created_at?: string;
+  let dot = 0;
+  let magA = 0;
+  let magB = 0;
+
+  for (let i = 0; i < a.length; i += 1) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+
+  const denominator = Math.sqrt(magA) * Math.sqrt(magB);
+  return denominator ? dot / denominator : 0;
 }
 
 async function exportQA(
@@ -692,10 +747,10 @@ async function exportQA(
     .all(contentId) as QARow[];
 
   if (qaRows.length === 0) {
-    throw new Error("No Q&A to export");
+    throw new Error("No Q&A to export.");
   }
 
-  const safeTitle = title.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 50);
+  const safeTitle = title.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 50) || "youtube";
   const timestamp = new Date().toISOString().split("T")[0];
 
   if (format === "json") {
@@ -703,51 +758,46 @@ async function exportQA(
       title,
       content_id: contentId,
       exported_at: new Date().toISOString(),
-      qa: qaRows.map((r) => ({
-        question: r.question,
-        answer: r.answer,
-        created_at: r.created_at,
+      qa: qaRows.map((row) => ({
+        question: row.question,
+        answer: row.answer,
+        created_at: row.created_at,
       })),
     };
+
     const filename = `${safeTitle}_qa_${timestamp}.json`;
     await Bun.write(filename, JSON.stringify(exportData, null, 2));
     return filename;
-  } else {
-    const markdown = [
-      `# Q&A Export: ${title}`,
-      ``,
-      `*Exported: ${new Date().toISOString()}*`,
-      ``,
-      ...qaRows.flatMap((r, i) => [
-        `## Question ${i + 1}`,
-        ``,
-        `**Q:** ${r.question}`,
-        ``,
-        `**A:** ${r.answer}`,
-        ``,
-        `---`,
-        ``,
-      ]),
-    ].join("\n");
-    const filename = `${safeTitle}_qa_${timestamp}.md`;
-    await Bun.write(filename, markdown);
-    return filename;
   }
+
+  const markdown = [
+    `# Q&A Export: ${title}`,
+    "",
+    `*Exported: ${new Date().toISOString()}*`,
+    "",
+    ...qaRows.flatMap((row, index) => [
+      `## Question ${index + 1}`,
+      "",
+      `**Q:** ${row.question}`,
+      "",
+      `**A:** ${row.answer}`,
+      "",
+      "---",
+      "",
+    ]),
+  ].join("\n");
+
+  const filename = `${safeTitle}_qa_${timestamp}.md`;
+  await Bun.write(filename, markdown);
+  return filename;
 }
 
-// ────────────────────────────────────────────────────────────────
-// 10. CLI interaction loop
-// ────────────────────────────────────────────────────────────────
-
-import { search, select, input, confirm } from "@inquirer/prompts";
-import { parseArgs } from "util";
-
 async function main() {
-  // Parse CLI arguments
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
     options: {
       url: { type: "string", short: "u" },
+      rerun: { type: "string", short: "r" },
       find: { type: "string", short: "f" },
       delete: { type: "string", short: "d" },
       help: { type: "boolean", short: "h" },
@@ -760,53 +810,45 @@ async function main() {
 Usage: bun run src/youtube.ts [options]
 
 Options:
-  -u, --url <url>      Process a YouTube or podcast URL directly (non-interactive)
-  -f, --find <text>    Find a session by fuzzy matching description
-  -d, --delete <url>   Delete a video/podcast and its Q&A from the database
+  -u, --url <url>      Process a YouTube URL directly (non-interactive)
+  -r, --rerun <url>    Re-fetch and re-summarize a saved YouTube URL
+  -f, --find <text>    Find a saved YouTube session by semantic match
+  -d, --delete <url>   Delete a saved YouTube session and its Q&A
   -h, --help           Show this help message
 
-Interactive mode (default):
-  Run without options to use the interactive session picker.
+Interactive mode:
+  Run without options to pick a saved transcript or start a new one.
 `);
     return;
   }
 
   const db = await initDb();
+
   try {
     let data: ContentData;
 
-    // Non-interactive: --delete flag
     if (values.delete) {
-      const urlToDelete = values.delete.trim();
-      const videoId = getVideoId(urlToDelete);
-      let contentId = videoId;
-
-      // If not a YouTube URL, try podcast format
+      const videoId = getVideoId(values.delete.trim());
       if (!videoId) {
-        const podcastMatch = urlToDelete.match(/\/id(\d+)/);
-        const episodeId = urlToDelete.match(/[?&]i=(\d+)/)?.[1] ?? "";
-        if (podcastMatch) {
-          contentId = `podcast_${podcastMatch[1]}_episode_${episodeId}`;
-        }
-      }
-
-      if (!contentId) {
-        console.error("Could not parse URL. Please provide a valid YouTube or podcast URL.");
-        return;
+        throw new Error("Please provide a valid YouTube URL to delete.");
       }
 
       const existing = db
-        .query("SELECT title FROM content WHERE content_id = ?")
-        .get(contentId) as { title: string } | null;
+        .query(
+          "SELECT title FROM content WHERE content_id = ? AND content_type = 'youtube'"
+        )
+        .get(videoId) as { title: string } | null;
 
       if (!existing) {
-        console.log(`No entry found for: ${contentId}`);
+        console.log(`No YouTube entry found for: ${videoId}`);
         return;
       }
 
-      // Delete Q&A first (foreign key), then content
-      const qaResult = db.run("DELETE FROM qa WHERE content_id = ?", [contentId]);
-      const contentResult = db.run("DELETE FROM content WHERE content_id = ?", [contentId]);
+      const qaResult = db.run("DELETE FROM qa WHERE content_id = ?", [videoId]);
+      const contentResult = db.run(
+        "DELETE FROM content WHERE content_id = ? AND content_type = 'youtube'",
+        [videoId]
+      );
 
       console.log(`Deleted "${existing.title}"`);
       console.log(`  - Removed ${qaResult.changes} Q&A entries`);
@@ -814,52 +856,57 @@ Interactive mode (default):
       return;
     }
 
-    // Non-interactive: --url flag
     if (values.url) {
       data = await getOrCreateTranscript(db, values.url.trim());
       console.log(`\nTitle: ${data.title}`);
-      if (data.author) console.log(`Author: ${data.author}`);
       console.log(`\nSummary:\n${data.summary}\n`);
       return;
     }
 
-    // Non-interactive: --find flag (fuzzy search using embeddings)
+    if (values.rerun) {
+      data = await getOrCreateTranscript(db, values.rerun.trim(), {
+        forceRefresh: true,
+      });
+      console.log(`\nTitle: ${data.title}`);
+      console.log(`\nSummary:\n${data.summary}\n`);
+      return;
+    }
+
     if (values.find) {
       console.log(`Searching for: "${values.find}"...`);
       data = await restoreSession(db, values.find);
-      data.transcript = decodeTranscript(data.transcript);
       console.log(`\nFound: ${data.title}`);
-      if (data.author) console.log(`Author: ${data.author}`);
       console.log(`\nSummary:\n${data.summary}\n`);
       return;
     }
 
-    // Interactive mode
     const sessions = db
       .query(
-        `SELECT content_id, title, content_type, DATE(created_at) AS created
-         FROM content ORDER BY created_at DESC`
+        `SELECT content_id, title, DATE(created_at) AS created
+         FROM content
+         WHERE content_type = 'youtube'
+         ORDER BY created_at DESC`
       )
       .all() as {
         content_id: string;
         title: string;
-        content_type: string;
         created: string;
       }[];
 
-    console.log(`Loaded ${sessions.length} sessions from DB.`);
+    console.log(`Loaded ${sessions.length} YouTube sessions from DB.`);
 
     let lastTerm = "";
     const pick = await search({
       message: "Select a saved transcript or start a new one:",
       source: async (term) => {
         lastTerm = term || "";
+
         if (!term) {
           return [
             { name: "Start new session", value: "__new" },
-            ...sessions.map((s) => ({
-              name: `${s.title}  – ${s.content_type.toUpperCase()}  [${s.created}]`,
-              value: s.content_id,
+            ...sessions.map((session) => ({
+              name: `${session.title} [${session.created}]`,
+              value: session.content_id,
             })),
           ];
         }
@@ -874,13 +921,12 @@ Interactive mode (default):
           ];
         }
 
-        // Filter sessions
         const lowerTerm = term.toLowerCase();
         return sessions
-          .filter((s) => s.title.toLowerCase().includes(lowerTerm))
-          .map((s) => ({
-            name: `${s.title}  – ${s.content_type.toUpperCase()}  [${s.created}]`,
-            value: s.content_id,
+          .filter((session) => session.title.toLowerCase().includes(lowerTerm))
+          .map((session) => ({
+            name: `${session.title} [${session.created}]`,
+            value: session.content_id,
           }));
       },
       pageSize: 12,
@@ -890,71 +936,88 @@ Interactive mode (default):
       if (lastTerm.startsWith("http") || lastTerm.startsWith("www")) {
         data = await getOrCreateTranscript(db, lastTerm.trim());
       } else {
-        const url = await input({
-          message: "Enter YouTube or Apple Podcast URL:",
-        });
+        const url = await input({ message: "Enter YouTube URL:" });
         data = await getOrCreateTranscript(db, url.trim());
       }
     } else if (pick.startsWith("__url:")) {
-      const url = pick.substring(6);
-      data = await getOrCreateTranscript(db, url.trim());
+      data = await getOrCreateTranscript(db, pick.slice(6).trim());
     } else {
-      data = db
-        .query("SELECT * FROM content WHERE content_id = ?")
-        .get(pick) as ContentData;
-
-      if (!data) throw new Error("Session not found in DB");
-      data.transcript = decodeTranscript(data.transcript);
+      const row = db
+        .query("SELECT * FROM content WHERE content_id = ? AND content_type = 'youtube'")
+        .get(pick) as StoredContentRow | null;
+      const loaded = toContentData(row);
+      if (!loaded) throw new Error("Session not found in DB.");
+      data = loaded;
     }
 
     console.log(`\nTitle: ${data.title}`);
-    if (data.author) console.log(`Author: ${data.author}`);
     console.log(`\nSummary: ${data.summary}\n`);
 
-    /* QA selector loop */
+    let qaIndexPromise: Promise<RagIndex> | undefined;
+
     while (true) {
       const qaRows = db
         .query(
           "SELECT id, question, answer FROM qa WHERE content_id = ? ORDER BY created_at DESC"
         )
-        .all(data.content_id) as {
-          id: number;
-          question: string;
-          answer: string;
-        }[];
+        .all(data.content_id) as QARow[];
 
-      const sel = await select({
+      const selection = await select({
         message: `Questions (${PROVIDERS.QA_MODEL}):`,
         choices: [
-          { name: "🆕  New question", value: "__new" },
-          ...qaRows.map((r) => ({ name: r.question, value: String(r.id) })),
-          { name: "📤  Export Q&A", value: "__export" },
-          { name: "🗑️   Delete this session", value: "__delete" },
+          { name: "New question", value: "__new" },
+          ...qaRows.map((row) => ({ name: row.question, value: String(row.id) })),
+          { name: "Re-run this video", value: "__rerun" },
+          { name: "Export Q&A", value: "__export" },
+          { name: "Delete this session", value: "__delete" },
           { name: "Exit", value: "__exit" },
         ],
         pageSize: 12,
-        default: "0",
       });
 
-      if (sel === "__exit") break;
+      if (selection === "__exit") break;
 
-      if (sel === "__delete") {
+      if (selection === "__delete") {
         const confirmed = await confirm({
           message: `Delete "${data.title}" and all its Q&A? This cannot be undone.`,
           default: false,
         });
-        if (confirmed) {
-          const qaResult = db.run("DELETE FROM qa WHERE content_id = ?", [data.content_id]);
-          const contentResult = db.run("DELETE FROM content WHERE content_id = ?", [data.content_id]);
-          console.log(`\nDeleted "${data.title}"`);
-          console.log(`  - Removed ${qaResult.changes} Q&A entries`);
-          console.log(`  - Removed ${contentResult.changes} content entry\n`);
-          break;
-        }
+
+        if (!confirmed) continue;
+
+        const qaResult = db.run("DELETE FROM qa WHERE content_id = ?", [data.content_id]);
+        const contentResult = db.run(
+          "DELETE FROM content WHERE content_id = ? AND content_type = 'youtube'",
+          [data.content_id]
+        );
+
+        console.log(`\nDeleted "${data.title}"`);
+        console.log(`  - Removed ${qaResult.changes} Q&A entries`);
+        console.log(`  - Removed ${contentResult.changes} content entry\n`);
+        break;
+      }
+
+      if (selection === "__rerun") {
+        const confirmed = await confirm({
+          message:
+            "Re-run this YouTube video from source and replace the saved transcript/summary? Cached Q&A will be cleared.",
+          default: false,
+        });
+
+        if (!confirmed) continue;
+
+        data = await getOrCreateTranscript(
+          db,
+          `https://www.youtube.com/watch?v=${data.content_id}`,
+          { forceRefresh: true }
+        );
+        qaIndexPromise = undefined;
+        console.log(`\nTitle: ${data.title}`);
+        console.log(`\nSummary: ${data.summary}\n`);
         continue;
       }
 
-      if (sel === "__export") {
+      if (selection === "__export") {
         try {
           const format = await select({
             message: "Export format:",
@@ -965,31 +1028,38 @@ Interactive mode (default):
           });
           const filename = await exportQA(db, data.content_id, data.title, format);
           console.log(`\nExported to: ${filename}\n`);
-        } catch (err: any) {
-          console.error(`Export failed: ${err.message}`);
+        } catch (error) {
+          console.error(
+            `Export failed: ${error instanceof Error ? error.message : String(error)}`
+          );
         }
         continue;
       }
 
-      if (sel === "__new") {
-        const newQ = await input({
-          message: "question:",
-        });
-        if (!newQ.trim()) continue;
+      if (selection === "__new") {
+        const question = await input({ message: "Question:" });
+        if (!question.trim()) continue;
 
-        const a = await answer(data.transcript, newQ);
-        console.log(`\nAnswer: ${a}\n`);
-        storeQA(db, data.content_id, newQ, a);
-      } else {
-        const qa = qaRows.find((r) => String(r.id) === sel)!;
+        if (!qaIndexPromise) {
+          console.log("Indexing transcript for Q&A...");
+          qaIndexPromise = buildQaIndex(data.transcript);
+        }
+
+        const answer = await answerQuestion(await qaIndexPromise, question.trim());
+        console.log(`\nAnswer: ${answer}\n`);
+        storeQA(db, data.content_id, question.trim(), answer);
+        continue;
+      }
+
+      const qa = qaRows.find((row) => String(row.id) === selection);
+      if (qa) {
         console.log(`\nAnswer: ${qa.answer}\n`);
       }
     }
-  } catch (err: any) {
-    console.error("Error:", err.message);
+  } catch (error) {
+    console.error("Error:", error instanceof Error ? error.message : String(error));
   } finally {
     db.close(true);
-    await new Promise((res) => setTimeout(res, 1000));
   }
 }
 
