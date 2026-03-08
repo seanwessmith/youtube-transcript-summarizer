@@ -1,7 +1,7 @@
 # YouTube Rag Project Guidelines
 
 ## Commands
-- Build/Run: `bun run youtube` or `bun run pdf`
+- Build/Run: `bun run youtube`
 - Typecheck: `bun run typecheck`
 - TypeScript: Strict mode enabled in `tsconfig.json`
 

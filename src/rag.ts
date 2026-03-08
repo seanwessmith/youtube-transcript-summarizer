@@ -16,6 +16,12 @@ export interface RagIndex {
 }
 
 export type EmbedText = (text: string) => Promise<number[]>;
+export type EmbedTexts = (texts: string[]) => Promise<number[][]>;
+
+export interface ScoredChunk {
+  chunk: TextChunk;
+  score: number;
+}
 
 export function countWords(text: string): number {
   const trimmed = text.trim();
@@ -71,14 +77,19 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 
 export async function buildRagIndex(
   text: string,
-  embedText: EmbedText,
+  embedTexts: EmbedTexts,
   options: ChunkOptions
 ): Promise<RagIndex> {
   const chunks = chunkText(text, options);
-  const embeddings: number[][] = [];
+  if (chunks.length === 0) {
+    return { chunks, embeddings: [] };
+  }
 
-  for (const chunk of chunks) {
-    embeddings.push(await embedText(chunk.text));
+  const embeddings = await embedTexts(chunks.map((chunk) => chunk.text));
+  if (embeddings.length !== chunks.length) {
+    throw new Error(
+      `Expected ${chunks.length} embeddings, received ${embeddings.length}.`
+    );
   }
 
   return { chunks, embeddings };
@@ -88,13 +99,15 @@ export async function selectRelevantChunks(
   index: RagIndex,
   question: string,
   embedText: EmbedText,
-  maxChunks: number
-): Promise<TextChunk[]> {
+  maxChunks: number,
+  minScore = Number.NEGATIVE_INFINITY
+): Promise<ScoredChunk[]> {
   if (index.chunks.length === 0 || maxChunks <= 0) return [];
 
   const questionEmbedding = await embedText(question);
   if (questionEmbedding.length === 0) {
-    return index.chunks.slice(0, maxChunks);
+    if (minScore > 0) return [];
+    return index.chunks.slice(0, maxChunks).map((chunk) => ({ chunk, score: 0 }));
   }
 
   return index.chunks
@@ -102,17 +115,18 @@ export async function selectRelevantChunks(
       chunk,
       score: cosineSimilarity(questionEmbedding, index.embeddings[chunkIndex] ?? []),
     }))
+    .filter((entry) => entry.score >= minScore)
     .sort((a, b) => b.score - a.score || a.chunk.index - b.chunk.index)
     .slice(0, Math.min(maxChunks, index.chunks.length))
     .sort((a, b) => a.chunk.index - b.chunk.index)
-    .map(({ chunk }) => chunk);
+    .map(({ chunk, score }) => ({ chunk, score }));
 }
 
-export function formatContext(chunks: TextChunk[]): string {
+export function formatContext(chunks: Array<TextChunk | ScoredChunk>): string {
   return chunks
-    .map(
-      (chunk, index) =>
-        `Excerpt ${index + 1} (words ${chunk.startWord + 1}-${chunk.endWord}):\n${chunk.text}`
-    )
+    .map((entry, index) => {
+      const chunk = "chunk" in entry ? entry.chunk : entry;
+      return `Excerpt ${index + 1} (words ${chunk.startWord + 1}-${chunk.endWord}):\n${chunk.text}`;
+    })
     .join("\n\n");
 }

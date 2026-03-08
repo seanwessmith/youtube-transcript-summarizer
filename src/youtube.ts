@@ -12,10 +12,12 @@ import OpenAI from "openai";
 import {
   buildRagIndex,
   chunkText,
+  cosineSimilarity,
   countWords,
   formatContext,
   selectRelevantChunks,
   type RagIndex,
+  type TextChunk,
 } from "./rag.ts";
 
 dotenv.config();
@@ -29,23 +31,99 @@ const WHISPER_MODEL_PATH =
 
 const defaultModel = "gpt-5-mini";
 const PROVIDERS = {
-  SUMMARY_MODEL: process.env.SUMMARY_MODEL || defaultModel,
-  QA_MODEL: process.env.QA_MODEL || defaultModel,
-  EMBEDDING_MODEL: process.env.EMBEDDING_MODEL || "text-embedding-3-small",
+  SUMMARY_MODEL: process.env.SUMMARY_MODEL?.trim() || defaultModel,
+  QA_MODEL: process.env.QA_MODEL?.trim() || defaultModel,
+  EMBEDDING_MODEL:
+    process.env.EMBEDDING_MODEL?.trim() || "text-embedding-3-small",
 };
 
 const SUMMARY_CHUNK_CONFIG = { maxWords: 15000, overlapWords: 200 };
 const QA_CHUNK_CONFIG = { maxWords: 1200, overlapWords: 150 };
 const QA_CONTEXT_CHUNKS = 4;
+const QA_MIN_RELEVANCE_SCORE = 0.2;
 const FIND_MATCH_THRESHOLD = 0.8;
+const FIND_EMBEDDING_KIND = "find_summary";
+const EMBEDDING_BATCH_SIZE = 16;
+const MAX_DB_BACKUPS = 10;
+const UNSUPPORTED_ANSWER =
+  "I couldn't find support for that in the retrieved transcript excerpts.";
+const NO_CAPTION_PATTERNS = [
+  /there are no subtitles/i,
+  /requested subtitles.*not available/i,
+  /requested languages?.*not available/i,
+  /no automatic captions/i,
+  /subtitles are not available/i,
+  /video doesn't have subtitles/i,
+];
 
-if (!process.env.OPENAI_API_KEY) {
-  throw new Error("OPENAI_API_KEY is required.");
+let openaiClient: OpenAI | null = null;
+const backedUpDatabases = new Set<string>();
+
+interface ContentData {
+  contentId: string;
+  title: string;
+  transcript: string;
+  summary: string;
+  createdAt?: string;
 }
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+interface StoredContentRow {
+  content_id: string;
+  content_type: string;
+  title: string | null;
+  transcript: unknown;
+  summary: string | null;
+  created_at?: string;
+}
+
+interface QARow {
+  id: number;
+  question: string;
+  answer: string;
+  created_at?: string;
+}
+
+interface TranscriptOptions {
+  forceRefresh?: boolean;
+}
+
+interface DatabaseHandle {
+  db: Database;
+  path: string;
+  hadExistingData: boolean;
+}
+
+interface StoredContentEmbeddingRow {
+  content_id: string;
+  source_text: string;
+  embedding: string;
+}
+
+interface StoredChunkEmbeddingRow {
+  chunk_index: number;
+  start_word: number;
+  end_word: number;
+  text: string;
+  embedding: string;
+}
+
+interface PersistedChunkEmbedding {
+  chunk: TextChunk;
+  embedding: number[];
+}
+
+const getOpenAIClient = (): OpenAI => {
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is required for this action.");
+  }
+
+  if (!openaiClient) {
+    openaiClient = new OpenAI({ apiKey });
+  }
+
+  return openaiClient;
+};
 
 const zip = (text: string): Uint8Array =>
   Bun.gzipSync(new TextEncoder().encode(text));
@@ -90,6 +168,19 @@ const decodeTranscript = (raw: unknown): string => {
   return String(raw);
 };
 
+const encodeEmbedding = (embedding: number[]): string => JSON.stringify(embedding);
+
+const decodeEmbedding = (raw: string): number[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.every((value) => typeof value === "number")
+      ? parsed
+      : [];
+  } catch {
+    return [];
+  }
+};
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const createTempDir = (prefix: string): string =>
@@ -122,6 +213,33 @@ const readProcessOutput = (value: unknown): string => {
     );
   }
   return String(value);
+};
+
+const collapseWhitespace = (text: string): string =>
+  text.replace(/\s+/g, " ").trim();
+
+const getProcessFailureOutput = (error: unknown): string => {
+  const failure = error as { stderr?: unknown; stdout?: unknown };
+  return [
+    readProcessOutput(failure.stderr),
+    readProcessOutput(failure.stdout),
+    error instanceof Error ? error.message : String(error),
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+};
+
+const describeProcessError = (error: unknown): string => {
+  const output = getProcessFailureOutput(error);
+  if (!output) return "unknown process failure";
+
+  const bestLine = output
+    .split(/\r?\n/)
+    .map((line) => collapseWhitespace(line))
+    .find(Boolean);
+
+  return bestLine || collapseWhitespace(output);
 };
 
 const ensureLocalFile = (filePath: string, description: string) => {
@@ -191,6 +309,23 @@ const getVideoId = (input: string): string => {
   return fallbackMatch?.[1] ?? "";
 };
 
+const isNoCaptionFailure = (output: string): boolean =>
+  NO_CAPTION_PATTERNS.some((pattern) => pattern.test(output));
+
+const getSearchText = (row: ContentData): string =>
+  row.summary.trim() || row.title.trim() || row.contentId;
+
+const toContentData = (row: StoredContentRow | null): ContentData | null => {
+  if (!row) return null;
+  return {
+    contentId: row.content_id,
+    title: row.title?.trim() || `YouTube video ${row.content_id}`,
+    transcript: decodeTranscript(row.transcript),
+    summary: row.summary?.trim() || "",
+    createdAt: row.created_at,
+  };
+};
+
 async function fetchYoutubeTitle(videoId: string): Promise<string> {
   try {
     const url = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
@@ -205,6 +340,8 @@ async function fetchCaptionsWithYtDlp(
   videoUrl: string,
   videoId: string
 ): Promise<string | null> {
+  ensureLocalFile(YTDLP_BIN, "yt-dlp binary");
+
   const tmpDir = createTempDir("yt-captions-");
   const outputTemplate = path.join(tmpDir, "%(id)s.%(ext)s");
 
@@ -230,23 +367,29 @@ async function fetchCaptionsWithYtDlp(
     const transcript = extractVttText(raw);
     return transcript || null;
   } catch (error) {
-    const stderr = readProcessOutput((error as { stderr?: unknown })?.stderr);
-    if (stderr.includes("live event will begin")) {
+    const output = getProcessFailureOutput(error);
+    if (/live event will begin/i.test(output)) {
       throw new Error(
         "Cannot process upcoming live streams. Wait until the stream has finished."
       );
     }
-    if (stderr.includes("This video is unavailable")) {
+    if (/this video is unavailable/i.test(output)) {
       throw new Error("Video is unavailable or private.");
     }
-    console.warn("Captions unavailable, falling back to Whisper.");
-    return null;
+    if (isNoCaptionFailure(output)) {
+      console.warn("Captions unavailable, falling back to Whisper.");
+      return null;
+    }
+
+    throw new Error(`yt-dlp caption fetch failed: ${describeProcessError(error)}`);
   } finally {
     removeDir(tmpDir);
   }
 }
 
 async function transcribeYoutubeWithWhisper(videoUrl: string): Promise<string> {
+  ensureLocalFile(YTDLP_BIN, "yt-dlp binary");
+  ensureLocalFile(FFMPEG_BIN, "ffmpeg binary");
   ensureLocalFile(WHISPER_CLI_BIN, "Whisper CLI binary");
   ensureLocalFile(WHISPER_MODEL_PATH, "Whisper model");
 
@@ -255,7 +398,11 @@ async function transcribeYoutubeWithWhisper(videoUrl: string): Promise<string> {
   const chunkTemplate = path.join(tmpDir, "chunk_%03d.mp3");
 
   try {
-    await $`${YTDLP_BIN} --no-warnings -x --audio-format mp3 --audio-quality 128 -o ${audioTemplate} ${videoUrl}`.quiet();
+    try {
+      await $`${YTDLP_BIN} --no-warnings -x --audio-format mp3 --audio-quality 128 -o ${audioTemplate} ${videoUrl}`.quiet();
+    } catch (error) {
+      throw new Error(`yt-dlp audio download failed: ${describeProcessError(error)}`);
+    }
 
     const audioFiles = listMatchingFiles(
       tmpDir,
@@ -267,7 +414,11 @@ async function transcribeYoutubeWithWhisper(videoUrl: string): Promise<string> {
       throw new Error("yt-dlp did not produce an MP3 file for transcription.");
     }
 
-    await $`${FFMPEG_BIN} -hide_banner -loglevel error -i ${audioFile} -f segment -segment_time 600 -c copy ${chunkTemplate}`.quiet();
+    try {
+      await $`${FFMPEG_BIN} -hide_banner -loglevel error -i ${audioFile} -f segment -segment_time 600 -c copy ${chunkTemplate}`.quiet();
+    } catch (error) {
+      throw new Error(`ffmpeg audio segmentation failed: ${describeProcessError(error)}`);
+    }
 
     const chunkFiles = listMatchingFiles(
       tmpDir,
@@ -288,8 +439,21 @@ async function transcribeYoutubeWithWhisper(videoUrl: string): Promise<string> {
 
       console.log(`Transcribing chunk ${index + 1}/${chunkFiles.length}...`);
 
-      await $`${FFMPEG_BIN} -hide_banner -loglevel error -i ${chunkFile} -ar 16000 -ac 1 ${wavPath}`.quiet();
-      await $`${WHISPER_CLI_BIN} --no-prints --no-timestamps --output-txt --output-file ${outputBase} --language en --model ${WHISPER_MODEL_PATH} --file ${wavPath}`.quiet();
+      try {
+        await $`${FFMPEG_BIN} -hide_banner -loglevel error -i ${chunkFile} -ar 16000 -ac 1 ${wavPath}`.quiet();
+      } catch (error) {
+        throw new Error(
+          `ffmpeg WAV conversion failed for chunk ${index + 1}: ${describeProcessError(error)}`
+        );
+      }
+
+      try {
+        await $`${WHISPER_CLI_BIN} --no-prints --no-timestamps --output-txt --output-file ${outputBase} --language en --model ${WHISPER_MODEL_PATH} --file ${wavPath}`.quiet();
+      } catch (error) {
+        throw new Error(
+          `Whisper transcription failed for chunk ${index + 1}: ${describeProcessError(error)}`
+        );
+      }
 
       const transcriptPath = `${outputBase}.txt`;
       if (!fs.existsSync(transcriptPath)) {
@@ -313,48 +477,48 @@ async function transcribeYoutubeWithWhisper(videoUrl: string): Promise<string> {
   }
 }
 
-interface ContentData {
-  content_id: string;
-  content_type: "youtube";
-  title: string;
-  transcript: string;
-  summary: string;
-  created_at?: string;
-}
+const pruneBackups = (dbPath: string) => {
+  const backupDir = path.resolve(path.dirname(dbPath), "db_backups");
+  if (!fs.existsSync(backupDir)) return;
 
-interface StoredContentRow {
-  content_id: string;
-  content_type: string;
-  title: string;
-  transcript: unknown;
-  summary: string;
-  created_at?: string;
-}
+  const extension = path.extname(dbPath) || ".sqlite";
+  const baseName = path.basename(dbPath, extension);
 
-interface QARow {
-  id: number;
-  question: string;
-  answer: string;
-  created_at?: string;
-}
+  const backups = fs
+    .readdirSync(backupDir)
+    .filter(
+      (fileName) => fileName.startsWith(`${baseName}.`) && fileName.endsWith(extension)
+    )
+    .sort((a, b) => b.localeCompare(a));
 
-interface TranscriptOptions {
-  forceRefresh?: boolean;
-}
-
-const toContentData = (row: StoredContentRow | null): ContentData | null => {
-  if (!row) return null;
-  return {
-    content_id: row.content_id,
-    content_type: "youtube",
-    title: row.title || `YouTube video ${row.content_id}`,
-    transcript: decodeTranscript(row.transcript),
-    summary: row.summary || "",
-    created_at: row.created_at,
-  };
+  for (const oldBackup of backups.slice(MAX_DB_BACKUPS)) {
+    fs.rmSync(path.join(backupDir, oldBackup), { force: true });
+  }
 };
 
-async function initDb(): Promise<Database> {
+const backupDatabaseIfNeeded = (database: DatabaseHandle) => {
+  if (!database.hadExistingData || backedUpDatabases.has(database.path)) {
+    return;
+  }
+  if (!fs.existsSync(database.path) || fs.statSync(database.path).size === 0) {
+    backedUpDatabases.add(database.path);
+    return;
+  }
+
+  const backupDir = path.resolve(path.dirname(database.path), "db_backups");
+  fs.mkdirSync(backupDir, { recursive: true });
+
+  const extension = path.extname(database.path) || ".sqlite";
+  const baseName = path.basename(database.path, extension);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupPath = path.join(backupDir, `${baseName}.${timestamp}${extension}`);
+
+  fs.copyFileSync(database.path, backupPath);
+  backedUpDatabases.add(database.path);
+  pruneBackups(database.path);
+};
+
+async function initDb(): Promise<DatabaseHandle> {
   const resolveDbPath = (): string => {
     const envPath = process.env.TRANSCRIPTS_DB?.trim();
     if (envPath) return envPath;
@@ -391,20 +555,9 @@ async function initDb(): Promise<Database> {
   };
 
   const dbPath = resolveDbPath();
-
-  if (fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0) {
-    const backupDir = path.resolve(path.dirname(dbPath), "db_backups");
-    if (!fs.existsSync(backupDir)) {
-      fs.mkdirSync(backupDir, { recursive: true });
-    }
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    fs.copyFileSync(
-      dbPath,
-      path.join(backupDir, `transcripts.${timestamp}.sqlite`)
-    );
-  }
-
+  const hadExistingData = fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0;
   const db = new Database(dbPath);
+
   db.exec(`
     PRAGMA foreign_keys = ON;
 
@@ -427,26 +580,87 @@ async function initDb(): Promise<Database> {
       created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (content_id) REFERENCES content(content_id)
     );
+
+    CREATE TABLE IF NOT EXISTS content_embeddings (
+      content_id      TEXT NOT NULL,
+      embedding_kind  TEXT NOT NULL,
+      model           TEXT NOT NULL,
+      source_text     TEXT NOT NULL,
+      embedding       TEXT NOT NULL,
+      updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (content_id, embedding_kind, model),
+      FOREIGN KEY (content_id) REFERENCES content(content_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS transcript_chunk_embeddings (
+      content_id   TEXT NOT NULL,
+      model        TEXT NOT NULL,
+      chunk_index  INTEGER NOT NULL,
+      start_word   INTEGER NOT NULL,
+      end_word     INTEGER NOT NULL,
+      text         TEXT NOT NULL,
+      embedding    TEXT NOT NULL,
+      updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (content_id, model, chunk_index),
+      FOREIGN KEY (content_id) REFERENCES content(content_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_content_type_created_at
+      ON content (content_type, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_qa_content_created_at
+      ON qa (content_id, created_at DESC);
   `);
 
-  return db;
+  return { db, path: dbPath, hadExistingData };
 }
 
-function storeQA(
-  db: Database,
+const clearCachedEmbeddings = (db: Database, contentId: string) => {
+  db.run("DELETE FROM content_embeddings WHERE content_id = ?", [contentId]);
+  db.run("DELETE FROM transcript_chunk_embeddings WHERE content_id = ?", [
+    contentId,
+  ]);
+};
+
+const storeQA = (
+  database: DatabaseHandle,
   contentId: string,
   question: string,
   answer: string
-) {
-  db.run(`INSERT INTO qa (content_id, question, answer) VALUES (?, ?, ?)`, [
-    contentId,
-    question,
-    answer,
-  ]);
-}
+) => {
+  backupDatabaseIfNeeded(database);
+  database.db.run(
+    "INSERT INTO qa (content_id, question, answer) VALUES (?, ?, ?)",
+    [contentId, question, answer]
+  );
+};
+
+const deleteSession = (
+  database: DatabaseHandle,
+  contentId: string
+): { qaChanges: number; contentChanges: number } => {
+  let qaChanges = 0;
+  let contentChanges = 0;
+
+  const tx = database.db.transaction(() => {
+    qaChanges = database.db.run("DELETE FROM qa WHERE content_id = ?", [
+      contentId,
+    ]).changes;
+    clearCachedEmbeddings(database.db, contentId);
+    contentChanges = database.db.run(
+      "DELETE FROM content WHERE content_id = ? AND content_type = 'youtube'",
+      [contentId]
+    ).changes;
+  });
+
+  backupDatabaseIfNeeded(database);
+  tx();
+
+  return { qaChanges, contentChanges };
+};
 
 async function getOrCreateTranscript(
-  db: Database,
+  database: DatabaseHandle,
   url: string,
   options: TranscriptOptions = {}
 ): Promise<ContentData> {
@@ -456,7 +670,7 @@ async function getOrCreateTranscript(
   }
 
   const existing = toContentData(
-    db
+    database.db
       .query(
         "SELECT * FROM content WHERE content_id = ? AND content_type = 'youtube'"
       )
@@ -475,29 +689,41 @@ async function getOrCreateTranscript(
   const title = await titlePromise;
   const summary = await summarizeTranscript(transcript);
 
+  backupDatabaseIfNeeded(database);
+
   if (existing) {
-    const qaResult = db.run("DELETE FROM qa WHERE content_id = ?", [videoId]);
-    db.run(
-      `UPDATE content
-       SET title = ?, author = ?, audio_url = ?, transcript = ?, summary = ?, created_at = CURRENT_TIMESTAMP
-       WHERE content_id = ? AND content_type = 'youtube'`,
-      [title, "", "", zip(transcript), summary, videoId]
-    );
+    let clearedQaCount = 0;
+    const tx = database.db.transaction(() => {
+      clearedQaCount = database.db.run("DELETE FROM qa WHERE content_id = ?", [
+        videoId,
+      ]).changes;
+      clearCachedEmbeddings(database.db, videoId);
+      database.db.run(
+        `UPDATE content
+         SET title = ?, author = ?, audio_url = ?, transcript = ?, summary = ?, created_at = CURRENT_TIMESTAMP
+         WHERE content_id = ? AND content_type = 'youtube'`,
+        [title, "", "", zip(transcript), summary, videoId]
+      );
+    });
+    tx();
     console.log(
-      `Re-ran ${videoId} and cleared ${qaResult.changes} cached Q&A entr${qaResult.changes === 1 ? "y" : "ies"}.`
+      `Re-ran ${videoId} and cleared ${clearedQaCount} cached Q&A entr${clearedQaCount === 1 ? "y" : "ies"}.`
     );
   } else {
-    db.run(
-      `INSERT INTO content (content_id, content_type, title, author, audio_url, transcript, summary)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [videoId, "youtube", title, "", "", zip(transcript), summary]
-    );
+    const tx = database.db.transaction(() => {
+      database.db.run(
+        `INSERT INTO content (content_id, content_type, title, author, audio_url, transcript, summary)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [videoId, "youtube", title, "", "", zip(transcript), summary]
+      );
+      clearCachedEmbeddings(database.db, videoId);
+    });
+    tx();
     console.log("Transcript stored for", videoId);
   }
 
   return {
-    content_id: videoId,
-    content_type: "youtube",
+    contentId: videoId,
     title,
     transcript,
     summary,
@@ -549,7 +775,7 @@ async function completeChat(
   prompt: string
 ): Promise<string> {
   const response = await retryWithBackoff(() =>
-    openai.chat.completions.create({
+    getOpenAIClient().chat.completions.create({
       model,
       messages: [
         { role: "system", content: system },
@@ -644,18 +870,208 @@ Remove redundancy from overlapping sections. Preserve specificity and technical 
   );
 }
 
-async function getEmbedding(text: string): Promise<number[]> {
-  const result = await retryWithBackoff(() =>
-    openai.embeddings.create({
-      model: PROVIDERS.EMBEDDING_MODEL,
-      input: text,
-    })
-  );
-  return result.data[0]?.embedding ?? [];
+async function getEmbeddings(texts: string[]): Promise<number[][]> {
+  if (texts.length === 0) return [];
+
+  const embeddings = texts.map((): number[] => []);
+  const nonEmptyInputs = texts
+    .map((text, index) => ({ index, text: text.trim() }))
+    .filter((item) => item.text.length > 0);
+
+  for (let index = 0; index < nonEmptyInputs.length; index += EMBEDDING_BATCH_SIZE) {
+    const batch = nonEmptyInputs.slice(index, index + EMBEDDING_BATCH_SIZE);
+    const response = await retryWithBackoff(() =>
+      getOpenAIClient().embeddings.create({
+        model: PROVIDERS.EMBEDDING_MODEL,
+        input: batch.map((item) => item.text),
+      })
+    );
+
+    if (response.data.length !== batch.length) {
+      throw new Error(
+        `Expected ${batch.length} embeddings, received ${response.data.length}.`
+      );
+    }
+
+    response.data.forEach((item, batchIndex) => {
+      embeddings[batch[batchIndex].index] = item.embedding ?? [];
+    });
+  }
+
+  return embeddings;
 }
 
-async function buildQaIndex(transcript: string): Promise<RagIndex> {
-  return buildRagIndex(transcript, getEmbedding, QA_CHUNK_CONFIG);
+async function getEmbedding(text: string): Promise<number[]> {
+  const [embedding] = await getEmbeddings([text]);
+  return embedding ?? [];
+}
+
+async function getOrCreateFindEmbeddings(
+  database: DatabaseHandle,
+  rows: ContentData[]
+): Promise<number[][]> {
+  if (rows.length === 0) return [];
+
+  const storedRows = database.db
+    .query(
+      `SELECT content_id, source_text, embedding
+       FROM content_embeddings
+       WHERE embedding_kind = ? AND model = ?`
+    )
+    .all(FIND_EMBEDDING_KIND, PROVIDERS.EMBEDDING_MODEL) as StoredContentEmbeddingRow[];
+
+  const storedById = new Map(storedRows.map((row) => [row.content_id, row]));
+  const embeddingsById = new Map<string, number[]>();
+  const pending = rows
+    .map((row) => ({
+      contentId: row.contentId,
+      sourceText: getSearchText(row),
+      stored: storedById.get(row.contentId),
+    }))
+    .filter((entry) => {
+      const cached = entry.stored ? decodeEmbedding(entry.stored.embedding) : [];
+      if (
+        entry.stored &&
+        entry.stored.source_text === entry.sourceText &&
+        cached.length > 0
+      ) {
+        embeddingsById.set(entry.contentId, cached);
+        return false;
+      }
+      return true;
+    });
+
+  if (pending.length > 0) {
+    const freshEmbeddings = await getEmbeddings(
+      pending.map((entry) => entry.sourceText)
+    );
+
+    const tx = database.db.transaction(
+      (entries: Array<{ contentId: string; sourceText: string; embedding: number[] }>) => {
+        for (const entry of entries) {
+          database.db.run(
+            `INSERT INTO content_embeddings (
+               content_id,
+               embedding_kind,
+               model,
+               source_text,
+               embedding,
+               updated_at
+             )
+             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(content_id, embedding_kind, model)
+             DO UPDATE SET
+               source_text = excluded.source_text,
+               embedding = excluded.embedding,
+               updated_at = CURRENT_TIMESTAMP`,
+            [
+              entry.contentId,
+              FIND_EMBEDDING_KIND,
+              PROVIDERS.EMBEDDING_MODEL,
+              entry.sourceText,
+              encodeEmbedding(entry.embedding),
+            ]
+          );
+        }
+      }
+    );
+
+    backupDatabaseIfNeeded(database);
+    tx(
+      pending.map((entry, index) => ({
+        contentId: entry.contentId,
+        sourceText: entry.sourceText,
+        embedding: freshEmbeddings[index] ?? [],
+      }))
+    );
+
+    pending.forEach((entry, index) => {
+      embeddingsById.set(entry.contentId, freshEmbeddings[index] ?? []);
+    });
+  }
+
+  return rows.map((row) => embeddingsById.get(row.contentId) ?? []);
+}
+
+async function buildQaIndex(
+  database: DatabaseHandle,
+  contentId: string,
+  transcript: string
+): Promise<RagIndex> {
+  const chunks = chunkText(transcript, QA_CHUNK_CONFIG);
+  if (chunks.length === 0) {
+    return { chunks: [], embeddings: [] };
+  }
+
+  const storedRows = database.db
+    .query(
+      `SELECT chunk_index, start_word, end_word, text, embedding
+       FROM transcript_chunk_embeddings
+       WHERE content_id = ? AND model = ?
+       ORDER BY chunk_index ASC`
+    )
+    .all(contentId, PROVIDERS.EMBEDDING_MODEL) as StoredChunkEmbeddingRow[];
+
+  const storedEmbeddings = storedRows.map((row) => decodeEmbedding(row.embedding));
+  const canReuse =
+    storedRows.length === chunks.length &&
+    storedRows.every((row, index) => {
+      const chunk = chunks[index];
+      return (
+        row.chunk_index === chunk.index &&
+        row.start_word === chunk.startWord &&
+        row.end_word === chunk.endWord &&
+        row.text === chunk.text &&
+        storedEmbeddings[index].length > 0
+      );
+    });
+
+  if (canReuse) {
+    return { chunks, embeddings: storedEmbeddings };
+  }
+
+  const index = await buildRagIndex(transcript, getEmbeddings, QA_CHUNK_CONFIG);
+  const tx = database.db.transaction((entries: PersistedChunkEmbedding[]) => {
+    database.db.run(
+      "DELETE FROM transcript_chunk_embeddings WHERE content_id = ? AND model = ?",
+      [contentId, PROVIDERS.EMBEDDING_MODEL]
+    );
+
+    for (const entry of entries) {
+      database.db.run(
+        `INSERT INTO transcript_chunk_embeddings (
+           content_id,
+           model,
+           chunk_index,
+           start_word,
+           end_word,
+           text,
+           embedding,
+           updated_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+        [
+          contentId,
+          PROVIDERS.EMBEDDING_MODEL,
+          entry.chunk.index,
+          entry.chunk.startWord,
+          entry.chunk.endWord,
+          entry.chunk.text,
+          encodeEmbedding(entry.embedding),
+        ]
+      );
+    }
+  });
+
+  backupDatabaseIfNeeded(database);
+  tx(
+    index.chunks.map((chunk, indexPosition) => ({
+      chunk,
+      embedding: index.embeddings[indexPosition] ?? [],
+    }))
+  );
+
+  return index;
 }
 
 async function answerQuestion(index: RagIndex, question: string): Promise<string> {
@@ -663,8 +1079,14 @@ async function answerQuestion(index: RagIndex, question: string): Promise<string
     index,
     question,
     getEmbedding,
-    QA_CONTEXT_CHUNKS
+    QA_CONTEXT_CHUNKS,
+    QA_MIN_RELEVANCE_SCORE
   );
+
+  if (contextChunks.length === 0) {
+    return UNSUPPORTED_ANSWER;
+  }
+
   const context = formatContext(contextChunks);
 
   return completeChat(
@@ -681,11 +1103,11 @@ Rules:
 }
 
 async function restoreSession(
-  db: Database,
+  database: DatabaseHandle,
   narrative: string
 ): Promise<ContentData> {
   const rows = (
-    db
+    database.db
       .query("SELECT * FROM content WHERE content_type = 'youtube'")
       .all() as StoredContentRow[]
   )
@@ -695,9 +1117,11 @@ async function restoreSession(
   if (rows.length === 0) throw new Error("No YouTube sessions saved.");
 
   const queryEmbedding = await getEmbedding(narrative);
-  const summaryEmbeddings = await Promise.all(
-    rows.map((row) => getEmbedding(row.summary || row.title))
-  );
+  if (queryEmbedding.length === 0) {
+    throw new Error("Could not embed the search query.");
+  }
+
+  const summaryEmbeddings = await getOrCreateFindEmbeddings(database, rows);
 
   let bestIndex = -1;
   let bestScore = -Infinity;
@@ -715,23 +1139,6 @@ async function restoreSession(
   }
 
   return rows[bestIndex];
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length === 0 || b.length === 0 || a.length !== b.length) return 0;
-
-  let dot = 0;
-  let magA = 0;
-  let magB = 0;
-
-  for (let i = 0; i < a.length; i += 1) {
-    dot += a[i] * b[i];
-    magA += a[i] * a[i];
-    magB += b[i] * b[i];
-  }
-
-  const denominator = Math.sqrt(magA) * Math.sqrt(magB);
-  return denominator ? dot / denominator : 0;
 }
 
 async function exportQA(
@@ -822,7 +1229,8 @@ Interactive mode:
     return;
   }
 
-  const db = await initDb();
+  const database = await initDb();
+  const { db } = database;
 
   try {
     let data: ContentData;
@@ -837,34 +1245,29 @@ Interactive mode:
         .query(
           "SELECT title FROM content WHERE content_id = ? AND content_type = 'youtube'"
         )
-        .get(videoId) as { title: string } | null;
+        .get(videoId) as { title: string | null } | null;
 
       if (!existing) {
         console.log(`No YouTube entry found for: ${videoId}`);
         return;
       }
 
-      const qaResult = db.run("DELETE FROM qa WHERE content_id = ?", [videoId]);
-      const contentResult = db.run(
-        "DELETE FROM content WHERE content_id = ? AND content_type = 'youtube'",
-        [videoId]
-      );
-
-      console.log(`Deleted "${existing.title}"`);
-      console.log(`  - Removed ${qaResult.changes} Q&A entries`);
-      console.log(`  - Removed ${contentResult.changes} content entry`);
+      const result = deleteSession(database, videoId);
+      console.log(`Deleted "${existing.title || videoId}"`);
+      console.log(`  - Removed ${result.qaChanges} Q&A entries`);
+      console.log(`  - Removed ${result.contentChanges} content entry`);
       return;
     }
 
     if (values.url) {
-      data = await getOrCreateTranscript(db, values.url.trim());
+      data = await getOrCreateTranscript(database, values.url.trim());
       console.log(`\nTitle: ${data.title}`);
       console.log(`\nSummary:\n${data.summary}\n`);
       return;
     }
 
     if (values.rerun) {
-      data = await getOrCreateTranscript(db, values.rerun.trim(), {
+      data = await getOrCreateTranscript(database, values.rerun.trim(), {
         forceRefresh: true,
       });
       console.log(`\nTitle: ${data.title}`);
@@ -874,7 +1277,7 @@ Interactive mode:
 
     if (values.find) {
       console.log(`Searching for: "${values.find}"...`);
-      data = await restoreSession(db, values.find);
+      data = await restoreSession(database, values.find);
       console.log(`\nFound: ${data.title}`);
       console.log(`\nSummary:\n${data.summary}\n`);
       return;
@@ -889,7 +1292,7 @@ Interactive mode:
       )
       .all() as {
         content_id: string;
-        title: string;
+        title: string | null;
         created: string;
       }[];
 
@@ -905,7 +1308,7 @@ Interactive mode:
           return [
             { name: "Start new session", value: "__new" },
             ...sessions.map((session) => ({
-              name: `${session.title} [${session.created}]`,
+              name: `${session.title || session.content_id} [${session.created}]`,
               value: session.content_id,
             })),
           ];
@@ -923,9 +1326,11 @@ Interactive mode:
 
         const lowerTerm = term.toLowerCase();
         return sessions
-          .filter((session) => session.title.toLowerCase().includes(lowerTerm))
+          .filter((session) =>
+            (session.title || session.content_id).toLowerCase().includes(lowerTerm)
+          )
           .map((session) => ({
-            name: `${session.title} [${session.created}]`,
+            name: `${session.title || session.content_id} [${session.created}]`,
             value: session.content_id,
           }));
       },
@@ -934,13 +1339,13 @@ Interactive mode:
 
     if (pick === "__new") {
       if (lastTerm.startsWith("http") || lastTerm.startsWith("www")) {
-        data = await getOrCreateTranscript(db, lastTerm.trim());
+        data = await getOrCreateTranscript(database, lastTerm.trim());
       } else {
         const url = await input({ message: "Enter YouTube URL:" });
-        data = await getOrCreateTranscript(db, url.trim());
+        data = await getOrCreateTranscript(database, url.trim());
       }
     } else if (pick.startsWith("__url:")) {
-      data = await getOrCreateTranscript(db, pick.slice(6).trim());
+      data = await getOrCreateTranscript(database, pick.slice(6).trim());
     } else {
       const row = db
         .query("SELECT * FROM content WHERE content_id = ? AND content_type = 'youtube'")
@@ -960,7 +1365,7 @@ Interactive mode:
         .query(
           "SELECT id, question, answer FROM qa WHERE content_id = ? ORDER BY created_at DESC"
         )
-        .all(data.content_id) as QARow[];
+        .all(data.contentId) as QARow[];
 
       const selection = await select({
         message: `Questions (${PROVIDERS.QA_MODEL}):`,
@@ -985,15 +1390,10 @@ Interactive mode:
 
         if (!confirmed) continue;
 
-        const qaResult = db.run("DELETE FROM qa WHERE content_id = ?", [data.content_id]);
-        const contentResult = db.run(
-          "DELETE FROM content WHERE content_id = ? AND content_type = 'youtube'",
-          [data.content_id]
-        );
-
+        const result = deleteSession(database, data.contentId);
         console.log(`\nDeleted "${data.title}"`);
-        console.log(`  - Removed ${qaResult.changes} Q&A entries`);
-        console.log(`  - Removed ${contentResult.changes} content entry\n`);
+        console.log(`  - Removed ${result.qaChanges} Q&A entries`);
+        console.log(`  - Removed ${result.contentChanges} content entry\n`);
         break;
       }
 
@@ -1007,8 +1407,8 @@ Interactive mode:
         if (!confirmed) continue;
 
         data = await getOrCreateTranscript(
-          db,
-          `https://www.youtube.com/watch?v=${data.content_id}`,
+          database,
+          `https://www.youtube.com/watch?v=${data.contentId}`,
           { forceRefresh: true }
         );
         qaIndexPromise = undefined;
@@ -1026,7 +1426,7 @@ Interactive mode:
               { name: "JSON (.json)", value: "json" as const },
             ],
           });
-          const filename = await exportQA(db, data.content_id, data.title, format);
+          const filename = await exportQA(db, data.contentId, data.title, format);
           console.log(`\nExported to: ${filename}\n`);
         } catch (error) {
           console.error(
@@ -1038,16 +1438,17 @@ Interactive mode:
 
       if (selection === "__new") {
         const question = await input({ message: "Question:" });
-        if (!question.trim()) continue;
+        const trimmedQuestion = question.trim();
+        if (!trimmedQuestion) continue;
 
         if (!qaIndexPromise) {
           console.log("Indexing transcript for Q&A...");
-          qaIndexPromise = buildQaIndex(data.transcript);
+          qaIndexPromise = buildQaIndex(database, data.contentId, data.transcript);
         }
 
-        const answer = await answerQuestion(await qaIndexPromise, question.trim());
+        const answer = await answerQuestion(await qaIndexPromise, trimmedQuestion);
         console.log(`\nAnswer: ${answer}\n`);
-        storeQA(db, data.content_id, question.trim(), answer);
+        storeQA(database, data.contentId, trimmedQuestion, answer);
         continue;
       }
 
