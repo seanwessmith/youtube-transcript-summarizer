@@ -1,7 +1,9 @@
 # YouTube Rag Project Guidelines
 
 ## Commands
-- Build/Run: `bun run src/index.ts` or `npm run start`
+- Build/Run: `bun run youtube` or `npm run start`
+- Direct entrypoint: `bun run src/youtube.ts`
+- Typecheck: `bun run typecheck`
 - Test: No specific test command found (consider adding Jest/Vitest)
 - TypeScript: Strict mode enabled in tsconfig.json
 
@@ -14,7 +16,7 @@
 - Database: Bun's SQLite integration with consistent query patterns
 - Functions: Pure functions with descriptive names
 - API: Consistent OpenAI API call patterns
-- CLI: Readline for user interaction
+- CLI: Inquirer prompts for user interaction
 - Documentation: Add comments for key operations
 - Variables: Descriptive names in camelCase
 - Git: Commit messages follow conventional commits format

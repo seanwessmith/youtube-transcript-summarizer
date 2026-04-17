@@ -39,6 +39,7 @@ Optional overrides:
 
 ```bash
 bun run youtube
+npm run start
 bun run typecheck
 ```
 
@@ -59,8 +60,10 @@ The CLI can:
 Non-interactive usage:
 
 ```bash
-bun run src/youtube.ts --url "https://www.youtube.com/watch?v=<VIDEO_ID>"
-bun run src/youtube.ts --rerun "https://www.youtube.com/watch?v=<VIDEO_ID>"
-bun run src/youtube.ts --find "video about vector databases"
-bun run src/youtube.ts --delete "https://www.youtube.com/watch?v=<VIDEO_ID>"
+bun run youtube --url "https://www.youtube.com/watch?v=<VIDEO_ID>"
+bun run youtube --rerun "https://www.youtube.com/watch?v=<VIDEO_ID>"
+bun run youtube --find "video about vector databases"
+bun run youtube --delete "https://www.youtube.com/watch?v=<VIDEO_ID>"
 ```
+
+The `youtube` and `start` scripts both run the same CLI entrypoint: `src/youtube.ts`.

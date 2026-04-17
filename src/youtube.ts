@@ -37,7 +37,7 @@ const PROVIDERS = {
     process.env.EMBEDDING_MODEL?.trim() || "text-embedding-3-small",
 };
 
-const SUMMARY_CHUNK_CONFIG = { maxWords: 15000, overlapWords: 200 };
+const SUMMARY_CHUNK_CONFIG = { maxWords: 6000, overlapWords: 250 };
 const QA_CHUNK_CONFIG = { maxWords: 1200, overlapWords: 150 };
 const QA_CONTEXT_CHUNKS = 4;
 const QA_MIN_RELEVANCE_SCORE = 0.2;
@@ -798,27 +798,39 @@ async function summarizeChunk(
 
   return completeChat(
     PROVIDERS.SUMMARY_MODEL,
-    `You are an expert content analyst specializing in extracting insights from YouTube transcripts${chunkInfo}.
+    `You are a careful transcript summarizer${chunkInfo}. Your job is faithful compression, not creative interpretation.
 
-Analyze the transcript and provide:
+Rules:
+- Use only information explicitly supported by the transcript.
+- Do not invent quotes, names, titles, books, papers, tools, companies, or recommendations.
+- Preserve technical terms and proper nouns exactly as written when they are clear.
+- If the transcript is ambiguous, noisy, or incomplete, say so briefly instead of guessing.
+- Quotes must be exact text from the transcript. If no short exact quote stands out, write "None".
+- Recommendations belong in the final section only if the speaker clearly gives advice, steps, or actions.
+- Distinguish speaker opinions or claims from established facts when the wording makes that distinction clear.
 
-## Key Points
-- List 3-5 main ideas, arguments, or themes discussed
-- For each point, include specific details, examples, or data mentioned
-- Note any contrarian or surprising perspectives
+Return Markdown with exactly these sections:
 
-## Notable Quotes
-- Include 1-2 memorable or impactful direct quotes if any stand out
+## Main Points
+- 3-5 bullets covering the most important ideas in this part
+- Each bullet should include concrete supporting detail, examples, or data when present
+
+## Evidence & Examples
+- 2-4 bullets with notable supporting details, examples, caveats, disagreements, or non-obvious claims that matter for understanding this part
+- Write "None" if this part is too thin or repetitive to support the section
+
+## Exact Quotes
+- 0-2 bullets with short exact quotes copied from the transcript
+- Write "None" if there is no strong quote
 
 ## People & References
-- List any people, books, papers, companies, or tools mentioned
+- Bulleted list of clearly mentioned people, books, papers, companies, products, or tools
+- Write "None" if nothing specific is clearly named
 
-## Action Items / Takeaways
-- Practical advice or recommendations given
-- Things the viewer should consider doing
-
-Be specific and factual. Preserve technical terms and proper nouns exactly as used.`,
-    `Analyze this transcript:\n\n${chunk}`
+## Explicit Recommendations
+- Bulleted list of advice, steps, or actions clearly stated by the speaker
+- Write "None" if the speaker does not give explicit recommendations`,
+    `Analyze this transcript excerpt. Keep the summary faithful to this excerpt only.\n\n${chunk}`
   );
 }
 
@@ -844,27 +856,42 @@ async function summarizeTranscript(transcript: string): Promise<string> {
 
   return completeChat(
     PROVIDERS.SUMMARY_MODEL,
-    `You are an expert content analyst. You will receive analyses from different parts of a long YouTube transcript.
+    `You are synthesizing analyses from different parts of one long YouTube transcript into a final faithful summary.
 
-Synthesize them into a single cohesive summary following this structure:
+Rules:
+- Use only information present in the part analyses.
+- Deduplicate overlap without flattening away important one-off details.
+- Preserve important caveats, disagreements, and conditions when they materially change interpretation.
+- Do not elevate speculation into fact.
+- Keep exact quotes exactly as provided. If the quote quality is weak or unsupported, omit it.
+- Only include recommendations that are clearly stated by the speaker.
+- Prefer accuracy and signal over completeness. If a section is unsupported, write "None".
 
-## Key Points
-- Combine and deduplicate the main ideas across all parts
-- Prioritize the most significant and recurring themes
-- Include specific details and examples
+Return Markdown with exactly these sections:
 
-## Notable Quotes
-- Select the 2-3 best quotes from across all parts
+## Overall Summary
+- 1 short paragraph capturing the central thesis or purpose of the video
+
+## Main Points
+- 4-8 bullets covering the most important ideas across the full transcript
+- Include specific supporting detail where available
+
+## Important Details
+- 3-6 bullets with notable examples, evidence, caveats, disagreements, or rare but important details that should not be lost
+- Write "None" only if the transcript is unusually repetitive and adds no material details
+
+## Exact Quotes
+- 0-3 bullets with the strongest exact quotes from the transcript
+- Write "None" if there are no strong quotes
 
 ## People & References
-- Consolidated list of all people, books, papers, companies, and tools mentioned
+- Consolidated bulleted list of clearly mentioned people, books, papers, companies, products, or tools
+- Write "None" if nothing specific is clearly named
 
-## Action Items / Takeaways
-- Combined practical advice and recommendations
-- Remove duplicates and keep the most actionable items
-
-Remove redundancy from overlapping sections. Preserve specificity and technical accuracy.`,
-    `Synthesize these part analyses into a final summary:\n\n${chunkSummaries
+## Explicit Recommendations
+- Consolidated bulleted list of advice, steps, or actions clearly stated by the speaker
+- Write "None" if the speaker does not give explicit recommendations`,
+    `Synthesize these part analyses into one final summary:\n\n${chunkSummaries
       .map((summary, index) => `=== Part ${index + 1} ===\n${summary}`)
       .join("\n\n")}`
   );
