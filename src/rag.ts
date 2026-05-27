@@ -31,26 +31,6 @@ export function countWords(text: string): number {
 const normalizeChunkInput = (text: string): string =>
   text.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
 
-const splitIntoSegments = (text: string): string[] => {
-  const normalized = normalizeChunkInput(text);
-  if (!normalized) return [];
-
-  const paragraphMatches = normalized.match(/[^\n]+(?:\n(?!\n)[^\n]+)*/g) ?? [];
-  const segments = paragraphMatches
-    .flatMap((paragraph) => {
-      const compactParagraph = paragraph.replace(/\n+/g, " ").trim();
-      if (!compactParagraph) return [];
-
-      const sentenceMatches =
-        compactParagraph.match(/[^.!?\n]+(?:[.!?]+(?=\s|$)|$)/g) ?? [];
-      const sentences = sentenceMatches.map((sentence) => sentence.trim()).filter(Boolean);
-      return sentences.length > 0 ? sentences : [compactParagraph];
-    })
-    .filter(Boolean);
-
-  return segments.length > 0 ? segments : [normalized];
-};
-
 export function chunkText(text: string, options: ChunkOptions): TextChunk[] {
   const normalized = normalizeChunkInput(text);
   if (!normalized) return [];
@@ -58,64 +38,18 @@ export function chunkText(text: string, options: ChunkOptions): TextChunk[] {
   const maxWords = Math.max(1, options.maxWords);
   const overlapWords = Math.max(0, Math.min(options.overlapWords, maxWords - 1));
   const words = normalized.split(/\s+/);
-  const segments = splitIntoSegments(normalized);
   const chunks: TextChunk[] = [];
 
-  let segmentIndex = 0;
   let startWord = 0;
   let index = 0;
 
-  while (segmentIndex < segments.length && startWord < words.length) {
-    const chunkSegments: string[] = [];
-    let chunkWordCount = 0;
-    let endWord = startWord;
-
-    while (segmentIndex < segments.length) {
-      const segment = segments[segmentIndex];
-      const segmentWordCount = countWords(segment);
-      if (segmentWordCount === 0) {
-        segmentIndex += 1;
-        continue;
-      }
-
-      if (
-        chunkSegments.length > 0 &&
-        chunkWordCount + segmentWordCount > maxWords
-      ) {
-        break;
-      }
-
-      chunkSegments.push(segment);
-      chunkWordCount += segmentWordCount;
-      endWord += segmentWordCount;
-      segmentIndex += 1;
-
-      if (chunkWordCount >= maxWords) {
-        break;
-      }
-    }
-
-    if (chunkSegments.length === 0) {
-      const end = Math.min(startWord + maxWords, words.length);
-      chunks.push({
-        index,
-        startWord,
-        endWord: end,
-        text: words.slice(startWord, end).join(" "),
-      });
-
-      if (end >= words.length) break;
-
-      startWord = Math.max(0, end - overlapWords);
-      index += 1;
-      continue;
-    }
-
+  while (startWord < words.length) {
+    const endWord = Math.min(startWord + maxWords, words.length);
     chunks.push({
       index,
       startWord,
       endWord,
-      text: chunkSegments.join(" "),
+      text: words.slice(startWord, endWord).join(" "),
     });
 
     if (endWord >= words.length) break;

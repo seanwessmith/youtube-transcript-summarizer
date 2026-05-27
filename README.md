@@ -28,12 +28,21 @@ WHISPER_MODEL_PATH=./whisper.cpp/models/ggml-base.en.bin
 
 Optional overrides:
 
+- `MODEL_PROFILE` (`cheap`, `balanced`, or `quality`; defaults to `balanced`)
 - `SUMMARY_MODEL`
 - `QA_MODEL`
 - `EMBEDDING_MODEL`
 - `YTDLP_BIN`
 - `FFMPEG_BIN`
 - `TRANSCRIPTS_DB`
+
+Model profiles:
+
+- `cheap`: `gpt-5.4-nano` for summaries and Q&A
+- `balanced`: `gpt-5.4-mini` for summaries, `gpt-5.4-nano` for Q&A
+- `quality`: `gpt-5.5` for summaries, `gpt-5.4-mini` for Q&A
+
+Explicit `SUMMARY_MODEL` and `QA_MODEL` values override the selected profile.
 
 ## Commands
 

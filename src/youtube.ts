@@ -29,10 +29,35 @@ const WHISPER_CLI_BIN =
 const WHISPER_MODEL_PATH =
   process.env.WHISPER_MODEL_PATH || "./whisper.cpp/models/ggml-base.en.bin";
 
-const defaultModel = "gpt-5-mini";
+const MODEL_PROFILES = {
+  cheap: {
+    SUMMARY_MODEL: "gpt-5.4-nano",
+    QA_MODEL: "gpt-5.4-nano",
+  },
+  balanced: {
+    SUMMARY_MODEL: "gpt-5.4-mini",
+    QA_MODEL: "gpt-5.4-nano",
+  },
+  quality: {
+    SUMMARY_MODEL: "gpt-5.5",
+    QA_MODEL: "gpt-5.4-mini",
+  },
+} as const;
+
+type ModelProfile = keyof typeof MODEL_PROFILES;
+
+const getModelProfile = (): ModelProfile => {
+  const profile = process.env.MODEL_PROFILE?.trim().toLowerCase();
+  return profile === "cheap" || profile === "balanced" || profile === "quality"
+    ? profile
+    : "balanced";
+};
+
+const selectedModelProfile = MODEL_PROFILES[getModelProfile()];
 const PROVIDERS = {
-  SUMMARY_MODEL: process.env.SUMMARY_MODEL?.trim() || defaultModel,
-  QA_MODEL: process.env.QA_MODEL?.trim() || defaultModel,
+  SUMMARY_MODEL:
+    process.env.SUMMARY_MODEL?.trim() || selectedModelProfile.SUMMARY_MODEL,
+  QA_MODEL: process.env.QA_MODEL?.trim() || selectedModelProfile.QA_MODEL,
   EMBEDDING_MODEL:
     process.env.EMBEDDING_MODEL?.trim() || "text-embedding-3-small",
 };
@@ -93,6 +118,17 @@ interface DatabaseHandle {
   hadExistingData: boolean;
 }
 
+const clearTerminal = () => {
+  if (!process.stdout.isTTY) return;
+  process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
+};
+
+const printSummary = (data: ContentData, options: { clearBefore?: boolean } = {}) => {
+  if (options.clearBefore) clearTerminal();
+  console.log(`\nTitle: ${data.title}`);
+  console.log(`\nSummary:\n${data.summary}\n`);
+};
+
 interface StoredContentEmbeddingRow {
   content_id: string;
   source_text: string;
@@ -110,6 +146,14 @@ interface StoredChunkEmbeddingRow {
 interface PersistedChunkEmbedding {
   chunk: TextChunk;
   embedding: number[];
+}
+
+interface OpenAIErrorDetails {
+  status?: number;
+  code?: string;
+  type?: string;
+  message: string;
+  requestId?: string;
 }
 
 const getOpenAIClient = (): OpenAI => {
@@ -183,6 +227,82 @@ const decodeEmbedding = (raw: string): number[] => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const getHeaderValue = (
+  headers: Headers | Record<string, string> | undefined,
+  key: string
+): string | undefined => {
+  if (!headers) return undefined;
+  if (headers instanceof Headers) {
+    return headers.get(key) ?? undefined;
+  }
+
+  const match = Object.entries(headers).find(
+    ([headerKey]) => headerKey.toLowerCase() === key.toLowerCase()
+  );
+  return match?.[1];
+};
+
+const getOpenAIErrorDetails = (error: unknown): OpenAIErrorDetails => {
+  const candidate = error as {
+    status?: number;
+    statusCode?: number;
+    code?: string;
+    type?: string;
+    message?: string;
+    request_id?: string;
+    headers?: Headers | Record<string, string>;
+    error?: {
+      code?: string;
+      type?: string;
+      message?: string;
+    };
+    response?: {
+      headers?: Headers | Record<string, string>;
+      data?: {
+        error?: {
+          code?: string;
+          type?: string;
+          message?: string;
+        };
+      };
+    };
+  };
+
+  const responseError = candidate.response?.data?.error;
+  const nestedError = candidate.error;
+  const status = candidate.status ?? candidate.statusCode;
+  const message =
+    responseError?.message ||
+    nestedError?.message ||
+    candidate.message ||
+    (error instanceof Error ? error.message : String(error));
+  const code = responseError?.code || nestedError?.code || candidate.code;
+  const type = responseError?.type || nestedError?.type || candidate.type;
+  const requestId =
+    candidate.request_id ||
+    getHeaderValue(candidate.headers, "x-request-id") ||
+    getHeaderValue(candidate.response?.headers, "x-request-id");
+
+  return {
+    status,
+    code,
+    type,
+    message,
+    requestId,
+  };
+};
+
+const formatOpenAIError = (details: OpenAIErrorDetails): string =>
+  [
+    details.message.trim(),
+    details.code ? `code=${details.code}` : "",
+    details.type ? `type=${details.type}` : "",
+    details.status ? `status=${details.status}` : "",
+    details.requestId ? `request_id=${details.requestId}` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
+
 const createTempDir = (prefix: string): string =>
   fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 
@@ -252,7 +372,7 @@ const ensureLocalFile = (filePath: string, description: string) => {
 const normalizeTranscriptText = (text: string): string =>
   text.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
 
-const extractVttText = (raw: string): string =>
+export const extractVttText = (raw: string): string =>
   raw
     .split(/\r?\n/)
     .filter(
@@ -268,7 +388,7 @@ const extractVttText = (raw: string): string =>
     .replace(/\s+/g, " ")
     .trim();
 
-const getVideoId = (input: string): string => {
+export const getVideoId = (input: string): string => {
   const trimmed = input.trim();
   if (/^[A-Za-z0-9_-]{11}$/.test(trimmed)) return trimmed;
 
@@ -304,7 +424,7 @@ const getVideoId = (input: string): string => {
   }
 
   const fallbackMatch = trimmed.match(
-    /(?:v=|youtu\.be\/|\/embed\/|\/shorts\/|\/live\/)([A-Za-z0-9_-]{11})/
+    /(?:youtu\.be\/|youtube\.com\/(?:embed|shorts|live)\/|\/(?:embed|shorts|live)\/)([A-Za-z0-9_-]{11})/
   );
   return fallbackMatch?.[1] ?? "";
 };
@@ -742,23 +862,30 @@ async function retryWithBackoff<T>(
       return await fn();
     } catch (error) {
       lastError = error;
-      const message = error instanceof Error ? error.message : String(error);
+      const details = getOpenAIErrorDetails(error);
+      const message = details.message;
+      const isStatus429 = details.status === 429;
+      const isInsufficientQuota =
+        details.code === "insufficient_quota" ||
+        details.type === "insufficient_quota" ||
+        /insufficient_quota/i.test(message);
       const isRateLimit =
-        message.includes("Too Many Requests") ||
-        message.includes("429") ||
-        (error as { status?: number; statusCode?: number })?.status === 429 ||
-        (error as { status?: number; statusCode?: number })?.statusCode === 429;
+        !isInsufficientQuota &&
+        (details.code === "rate_limit_exceeded" ||
+          /rate limit/i.test(message) ||
+          /too many requests/i.test(message) ||
+          isStatus429);
       const isTimeout =
         message.toLowerCase().includes("timeout") ||
         message.includes("AbortError");
 
       if ((!isRateLimit && !isTimeout) || attempt === maxRetries - 1) {
-        throw new Error(`OpenAI API Error: ${message}`);
+        throw new Error(`OpenAI API Error: ${formatOpenAIError(details)}`);
       }
 
       const backoffMs = initialDelayMs * 2 ** attempt + Math.random() * 1000;
       console.log(
-        `${isTimeout ? "Timeout" : "Rate limited"}. Waiting ${Math.round(
+        `${isTimeout ? "Timeout" : "Rate limited"} (${formatOpenAIError(details)}). Waiting ${Math.round(
           backoffMs / 1000
         )}s before retry ${attempt + 1}/${maxRetries}...`
       );
@@ -1288,8 +1415,7 @@ Interactive mode:
 
     if (values.url) {
       data = await getOrCreateTranscript(database, values.url.trim());
-      console.log(`\nTitle: ${data.title}`);
-      console.log(`\nSummary:\n${data.summary}\n`);
+      printSummary(data, { clearBefore: true });
       return;
     }
 
@@ -1297,8 +1423,7 @@ Interactive mode:
       data = await getOrCreateTranscript(database, values.rerun.trim(), {
         forceRefresh: true,
       });
-      console.log(`\nTitle: ${data.title}`);
-      console.log(`\nSummary:\n${data.summary}\n`);
+      printSummary(data, { clearBefore: true });
       return;
     }
 
@@ -1371,8 +1496,10 @@ Interactive mode:
         const url = await input({ message: "Enter YouTube URL:" });
         data = await getOrCreateTranscript(database, url.trim());
       }
+      printSummary(data, { clearBefore: true });
     } else if (pick.startsWith("__url:")) {
       data = await getOrCreateTranscript(database, pick.slice(6).trim());
+      printSummary(data, { clearBefore: true });
     } else {
       const row = db
         .query("SELECT * FROM content WHERE content_id = ? AND content_type = 'youtube'")
@@ -1380,10 +1507,8 @@ Interactive mode:
       const loaded = toContentData(row);
       if (!loaded) throw new Error("Session not found in DB.");
       data = loaded;
+      printSummary(data);
     }
-
-    console.log(`\nTitle: ${data.title}`);
-    console.log(`\nSummary: ${data.summary}\n`);
 
     let qaIndexPromise: Promise<RagIndex> | undefined;
 
@@ -1439,8 +1564,7 @@ Interactive mode:
           { forceRefresh: true }
         );
         qaIndexPromise = undefined;
-        console.log(`\nTitle: ${data.title}`);
-        console.log(`\nSummary: ${data.summary}\n`);
+        printSummary(data, { clearBefore: true });
         continue;
       }
 
@@ -1486,9 +1610,12 @@ Interactive mode:
     }
   } catch (error) {
     console.error("Error:", error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
   } finally {
     db.close(true);
   }
 }
 
-main();
+if (import.meta.main) {
+  main();
+}

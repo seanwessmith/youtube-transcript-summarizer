@@ -1,0 +1,11 @@
+# Visit https://soloterm.com to learn more
+name: youtube-transcript-summarizer
+icon: null
+processes:
+  'bun: start':
+    command: bun run start
+    working_dir: null
+    auto_start: true
+    auto_restart: false
+    restart_when_changed: []
+    env: {}
