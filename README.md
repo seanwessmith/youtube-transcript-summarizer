@@ -13,7 +13,17 @@ This project stores YouTube transcripts in SQLite, generates summaries with Open
 ## Install
 
 ```bash
+git submodule update --init --recursive
 bun install
+```
+
+Build `whisper-cli` and download a Whisper model before using the local
+transcription fallback:
+
+```bash
+cmake -S whisper.cpp -B whisper.cpp/build
+cmake --build whisper.cpp/build --config Release
+./whisper.cpp/models/download-ggml-model.sh base.en
 ```
 
 ## Environment
@@ -50,7 +60,11 @@ Explicit `SUMMARY_MODEL` and `QA_MODEL` values override the selected profile.
 bun run youtube
 npm run start
 bun run typecheck
+bun run test
 ```
+
+`bun run test` is scoped to this app's `src` tests so it does not run unrelated
+vendored tests inside `whisper.cpp`.
 
 ## YouTube Flow
 
