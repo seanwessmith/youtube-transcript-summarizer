@@ -1,12 +1,18 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  DIRECT_CONTEXT_MAX_CHARS,
+  OpenAIRequestError,
+  buildQaPromptInput,
   chunkTranscriptForSummary,
   extractVttText,
+  getQaContextMode,
   getSummaryChunkConcurrency,
   getVideoId,
   parseContentInput,
   sanitizeColorEnv,
+  shouldUseDirectContext,
+  summarizeTranscript,
 } from "./youtube.ts";
 
 describe("getVideoId", () => {
@@ -206,5 +212,53 @@ describe("getSummaryChunkConcurrency", () => {
     expect(getSummaryChunkConcurrency("0")).toBe(3);
     expect(getSummaryChunkConcurrency("4")).toBe(4);
     expect(getSummaryChunkConcurrency("100")).toBe(8);
+  });
+});
+
+describe("long-context routing", () => {
+  test("uses the inclusive 500,000-character boundary", () => {
+    expect(shouldUseDirectContext("x".repeat(DIRECT_CONTEXT_MAX_CHARS - 1))).toBe(true);
+    expect(shouldUseDirectContext("x".repeat(DIRECT_CONTEXT_MAX_CHARS))).toBe(true);
+    expect(shouldUseDirectContext("x".repeat(DIRECT_CONTEXT_MAX_CHARS + 1))).toBe(false);
+  });
+
+  test("builds full-transcript prompts for short inputs and retrieval prompts for long ones", () => {
+    const shortTranscript = "opening fact ... closing fact";
+    expect(getQaContextMode(shortTranscript)).toBe("full");
+    expect(buildQaPromptInput("What happened?", shortTranscript)).toContain(
+      `Complete transcript:\n${shortTranscript}`
+    );
+
+    const longTranscript = "x".repeat(DIRECT_CONTEXT_MAX_CHARS + 1);
+    expect(getQaContextMode(longTranscript)).toBe("retrieval");
+    const prompt = buildQaPromptInput("What happened?", longTranscript, "Excerpt 1");
+    expect(prompt).toContain("Retrieved transcript excerpts:\nExcerpt 1");
+    expect(prompt).not.toContain(longTranscript);
+  });
+
+  test("falls back to chunked summarization when a direct request is too large", async () => {
+    let calls = 0;
+    const result = await summarizeTranscript(
+      "A short transcript that should normally use direct context.",
+      async (profile) => {
+        calls += 1;
+        if (calls === 1) {
+          throw new OpenAIRequestError({ status: 400, message: "maximum context length" });
+        }
+        return {
+          text: "fallback summary",
+          metrics: {
+            model: profile.model,
+            inputTokens: 10,
+            cachedInputTokens: 0,
+            outputTokens: 2,
+            durationMs: 5,
+            estimatedCostMicrousd: 4,
+          },
+        };
+      }
+    );
+    expect(calls).toBe(2);
+    expect(result.text).toBe("fallback summary");
   });
 });

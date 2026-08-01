@@ -17,6 +17,7 @@ tmp
 # Caches
 
 .cache
+eval-results/
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 

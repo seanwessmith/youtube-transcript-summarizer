@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-export const DATABASE_SCHEMA_VERSION = 1;
+export const DATABASE_SCHEMA_VERSION = 2;
 const MAX_DB_BACKUPS = 10;
 const backedUpDatabases = new Set<string>();
 
@@ -52,7 +52,7 @@ const migrateDatabase = (db: Database): void => {
   const versionRow = db.query("PRAGMA user_version").get() as {
     user_version: number;
   } | null;
-  const currentVersion = Number(versionRow?.user_version ?? 0);
+  let currentVersion = Number(versionRow?.user_version ?? 0);
   if (currentVersion > DATABASE_SCHEMA_VERSION) {
     throw new Error(
       `Database schema version ${currentVersion} is newer than supported version ${DATABASE_SCHEMA_VERSION}.`
@@ -107,6 +107,27 @@ const migrateDatabase = (db: Database): void => {
         CREATE INDEX IF NOT EXISTS idx_qa_content_created_at
           ON qa (content_id, created_at DESC);
         PRAGMA user_version = 1;
+      `);
+    })();
+    currentVersion = 1;
+  }
+
+  if (currentVersion < 2) {
+    db.transaction(() => {
+      db.exec(`
+        ALTER TABLE content ADD COLUMN summary_model TEXT;
+        ALTER TABLE content ADD COLUMN summary_input_tokens INTEGER;
+        ALTER TABLE content ADD COLUMN summary_cached_input_tokens INTEGER;
+        ALTER TABLE content ADD COLUMN summary_output_tokens INTEGER;
+        ALTER TABLE content ADD COLUMN summary_duration_ms INTEGER;
+        ALTER TABLE content ADD COLUMN summary_cost_microusd INTEGER;
+        ALTER TABLE qa ADD COLUMN model TEXT;
+        ALTER TABLE qa ADD COLUMN input_tokens INTEGER;
+        ALTER TABLE qa ADD COLUMN cached_input_tokens INTEGER;
+        ALTER TABLE qa ADD COLUMN output_tokens INTEGER;
+        ALTER TABLE qa ADD COLUMN duration_ms INTEGER;
+        ALTER TABLE qa ADD COLUMN cost_microusd INTEGER;
+        PRAGMA user_version = 2;
       `);
     })();
   }

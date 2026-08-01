@@ -6,7 +6,7 @@ export const sanitizeColorEnv = (): void => {
 
 sanitizeColorEnv();
 
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { $ } from "bun";
 import { confirm, expand, input, search, select } from "@inquirer/prompts";
 import axios from "axios";
@@ -18,13 +18,14 @@ import * as path from "node:path";
 import { parseArgs } from "node:util";
 import OpenAI from "openai";
 
-import { getAppConfig } from "./config.ts";
+import { getAppConfig, type ModelTaskProfile } from "./config.ts";
 import {
   backupDatabaseIfNeeded,
   clearCachedEmbeddings,
   decodeTranscript,
   encodeTranscript,
   openDatabase,
+  resolveDatabasePath,
   type DatabaseHandle,
 } from "./database.ts";
 
@@ -44,6 +45,14 @@ import {
   openSummaryInBrowser,
   type SummaryDocument,
 } from "./summary-output.ts";
+import {
+  aggregateMetrics,
+  estimateCostMicrousd,
+  formatRequestMetrics,
+  normalizeTokenUsage,
+  type CompletionResult,
+  type RequestMetrics,
+} from "./openai-metrics.ts";
 
 dotenv.config({ quiet: true });
 
@@ -127,8 +136,8 @@ export const getSummaryChunkConcurrency = (
 
 const appConfig = getAppConfig();
 const PROVIDERS = {
-  SUMMARY_MODEL: appConfig.summaryModel,
-  QA_MODEL: appConfig.qaModel,
+  SUMMARY: appConfig.summary,
+  QA: appConfig.qa,
   EMBEDDING_MODEL: appConfig.embeddingModel,
 };
 const TRANSCRIPT_LANGUAGE = appConfig.transcriptLanguage;
@@ -138,6 +147,7 @@ const SUMMARY_MAX_CHARS = 22000;
 const SUMMARY_RETRY_SPLIT_MIN_WORDS = 800;
 const SUMMARY_RETRY_SPLIT_OVERLAP_WORDS = 80;
 const SUMMARY_CHUNK_CONCURRENCY = getSummaryChunkConcurrency();
+export const DIRECT_CONTEXT_MAX_CHARS = 500_000;
 const QA_CHUNK_CONFIG = { maxWords: 1200, overlapWords: 150 };
 const QA_CONTEXT_CHUNKS = 4;
 const QA_MIN_RELEVANCE_SCORE = 0.2;
@@ -168,6 +178,7 @@ interface ContentData {
   title: string;
   transcript: string;
   summary: string;
+  summaryMetrics?: RequestMetrics | null;
   createdAt?: string;
 }
 
@@ -178,6 +189,12 @@ interface StoredContentRow {
   audio_url: string | null;
   transcript: unknown;
   summary: string | null;
+  summary_model?: string | null;
+  summary_input_tokens?: number | null;
+  summary_cached_input_tokens?: number | null;
+  summary_output_tokens?: number | null;
+  summary_duration_ms?: number | null;
+  summary_cost_microusd?: number | null;
   created_at?: string;
 }
 
@@ -185,6 +202,12 @@ interface QARow {
   id: number;
   question: string;
   answer: string;
+  model?: string | null;
+  input_tokens?: number | null;
+  cached_input_tokens?: number | null;
+  output_tokens?: number | null;
+  duration_ms?: number | null;
+  cost_microusd?: number | null;
   created_at?: string;
 }
 
@@ -210,6 +233,9 @@ const printSummary = (data: ContentData, options: { clearBefore?: boolean } = {}
       useColor,
     })}\n`
   );
+  if (data.summaryMetrics) {
+    console.log(`Summary usage: ${formatRequestMetrics(data.summaryMetrics)}\n`);
+  }
 };
 
 interface StoredContentEmbeddingRow {
@@ -231,7 +257,7 @@ interface PersistedChunkEmbedding {
   embedding: number[];
 }
 
-interface OpenAIErrorDetails {
+export interface OpenAIErrorDetails {
   status?: number;
   code?: string;
   type?: string;
@@ -239,7 +265,7 @@ interface OpenAIErrorDetails {
   requestId?: string;
 }
 
-class OpenAIRequestError extends Error {
+export class OpenAIRequestError extends Error {
   details: OpenAIErrorDetails;
 
   constructor(details: OpenAIErrorDetails) {
@@ -249,18 +275,23 @@ class OpenAIRequestError extends Error {
   }
 }
 
+let openaiClient: OpenAI | undefined;
+
 const getOpenAIClient = (): OpenAI => {
   const apiKey = process.env.OPENAI_API_KEY?.trim();
   if (!apiKey) {
     throw new Error("OPENAI_API_KEY is required for this action.");
   }
 
-  return new OpenAI({
-    apiKey,
-    maxRetries: 0,
-    organization: null,
-    project: null,
-  });
+  if (!openaiClient) {
+    openaiClient = new OpenAI({
+      apiKey,
+      maxRetries: 0,
+      organization: null,
+      project: null,
+    });
+  }
+  return openaiClient;
 };
 
 
@@ -731,6 +762,25 @@ const isNoCaptionFailure = (output: string): boolean =>
 const getSearchText = (row: ContentData): string =>
   row.summary.trim() || row.title.trim() || row.contentId;
 
+const metricsFromStoredValues = (values: {
+  model?: string | null;
+  inputTokens?: number | null;
+  cachedInputTokens?: number | null;
+  outputTokens?: number | null;
+  durationMs?: number | null;
+  costMicrousd?: number | null;
+}): RequestMetrics | null =>
+  values.model
+    ? {
+        model: values.model,
+        inputTokens: values.inputTokens ?? 0,
+        cachedInputTokens: values.cachedInputTokens ?? 0,
+        outputTokens: values.outputTokens ?? 0,
+        durationMs: values.durationMs ?? 0,
+        estimatedCostMicrousd: values.costMicrousd ?? null,
+      }
+    : null;
+
 const toContentData = (row: StoredContentRow | null): ContentData | null => {
   if (!row) return null;
   const contentType = isContentType(row.content_type) ? row.content_type : "youtube";
@@ -745,6 +795,14 @@ const toContentData = (row: StoredContentRow | null): ContentData | null => {
     title: row.title?.trim() || `${providerLabel} video ${sourceId}`,
     transcript: decodeTranscript(row.transcript),
     summary: row.summary?.trim() || "",
+    summaryMetrics: metricsFromStoredValues({
+      model: row.summary_model,
+      inputTokens: row.summary_input_tokens,
+      cachedInputTokens: row.summary_cached_input_tokens,
+      outputTokens: row.summary_output_tokens,
+      durationMs: row.summary_duration_ms,
+      costMicrousd: row.summary_cost_microusd,
+    }),
     createdAt: row.created_at,
   };
 };
@@ -929,12 +987,25 @@ const storeQA = (
   database: DatabaseHandle,
   contentId: string,
   question: string,
-  answer: string
+  result: CompletionResult
 ) => {
   backupDatabaseIfNeeded(database);
   database.db.run(
-    "INSERT INTO qa (content_id, question, answer) VALUES (?, ?, ?)",
-    [contentId, question, answer]
+    `INSERT INTO qa (
+       content_id, question, answer, model, input_tokens, cached_input_tokens,
+       output_tokens, duration_ms, cost_microusd
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      contentId,
+      question,
+      result.text,
+      result.metrics.model,
+      result.metrics.inputTokens,
+      result.metrics.cachedInputTokens,
+      result.metrics.outputTokens,
+      result.metrics.durationMs,
+      result.metrics.estimatedCostMicrousd,
+    ]
   );
 };
 
@@ -991,7 +1062,8 @@ async function getOrCreateTranscript(
   }
 
   const title = await titlePromise;
-  const summary = await summarizeTranscript(transcript);
+  const summaryResult = await summarizeTranscript(transcript);
+  const summary = summaryResult.text;
 
   backupDatabaseIfNeeded(database);
 
@@ -1004,7 +1076,11 @@ async function getOrCreateTranscript(
       clearCachedEmbeddings(database.db, content.contentId);
       database.db.run(
         `UPDATE content
-         SET title = ?, author = ?, audio_url = ?, transcript = ?, summary = ?, created_at = CURRENT_TIMESTAMP
+         SET title = ?, author = ?, audio_url = ?, transcript = ?, summary = ?,
+             summary_model = ?, summary_input_tokens = ?,
+             summary_cached_input_tokens = ?, summary_output_tokens = ?,
+             summary_duration_ms = ?, summary_cost_microusd = ?,
+             created_at = CURRENT_TIMESTAMP
          WHERE content_id = ? AND content_type = ?`,
         [
           title,
@@ -1012,6 +1088,12 @@ async function getOrCreateTranscript(
           fetchableUrl,
           encodeTranscript(transcript),
           summary,
+          summaryResult.metrics.model,
+          summaryResult.metrics.inputTokens,
+          summaryResult.metrics.cachedInputTokens,
+          summaryResult.metrics.outputTokens,
+          summaryResult.metrics.durationMs,
+          summaryResult.metrics.estimatedCostMicrousd,
           content.contentId,
           content.contentType,
         ]
@@ -1024,8 +1106,11 @@ async function getOrCreateTranscript(
   } else {
     const tx = database.db.transaction(() => {
       database.db.run(
-        `INSERT INTO content (content_id, content_type, title, author, audio_url, transcript, summary)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO content (
+           content_id, content_type, title, author, audio_url, transcript, summary,
+           summary_model, summary_input_tokens, summary_cached_input_tokens,
+           summary_output_tokens, summary_duration_ms, summary_cost_microusd
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           content.contentId,
           content.contentType,
@@ -1034,6 +1119,12 @@ async function getOrCreateTranscript(
           fetchableUrl,
           encodeTranscript(transcript),
           summary,
+          summaryResult.metrics.model,
+          summaryResult.metrics.inputTokens,
+          summaryResult.metrics.cachedInputTokens,
+          summaryResult.metrics.outputTokens,
+          summaryResult.metrics.durationMs,
+          summaryResult.metrics.estimatedCostMicrousd,
         ]
       );
       clearCachedEmbeddings(database.db, content.contentId);
@@ -1050,6 +1141,7 @@ async function getOrCreateTranscript(
     title,
     transcript,
     summary,
+    summaryMetrics: summaryResult.metrics,
   };
 }
 
@@ -1100,20 +1192,31 @@ async function retryWithBackoff<T>(
 }
 
 async function completeChat(
-  model: string,
+  profile: ModelTaskProfile,
   system: string,
   prompt: string
-): Promise<string> {
+): Promise<CompletionResult> {
+  const startedAt = performance.now();
   const response = await retryWithBackoff(() =>
     getOpenAIClient().responses.create({
-      model,
+      model: profile.model,
       instructions: system,
       input: prompt,
+      reasoning: { effort: profile.reasoningEffort },
+      text: { verbosity: profile.verbosity },
       store: false,
     })
   );
-
-  return response.output_text?.trim() || "";
+  const usage = normalizeTokenUsage(response.usage);
+  return {
+    text: response.output_text?.trim() || "",
+    metrics: {
+      model: profile.model,
+      ...usage,
+      durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      estimatedCostMicrousd: estimateCostMicrousd(profile.model, usage),
+    },
+  };
 }
 
 const splitByCharacterBudget = (
@@ -1193,11 +1296,83 @@ export const chunkTranscriptForSummary = (
     .flatMap((chunk) => splitByCharacterBudget(chunk, maxChars))
     .map((chunk, index) => ({ ...chunk, index }));
 
+export const shouldUseDirectContext = (transcript: string): boolean =>
+  transcript.length <= DIRECT_CONTEXT_MAX_CHARS;
+
+type CompletionFunction = (
+  profile: ModelTaskProfile,
+  system: string,
+  prompt: string
+) => Promise<CompletionResult>;
+
+const CHUNK_SUMMARY_INSTRUCTIONS = `You are a careful transcript summarizer. Your job is faithful compression, not creative interpretation.
+
+Rules:
+- Use only information explicitly supported by the transcript.
+- Do not invent quotes, names, titles, books, papers, tools, companies, or recommendations.
+- Preserve technical terms and proper nouns exactly as written when they are clear.
+- If the transcript is ambiguous, noisy, or incomplete, say so briefly instead of guessing.
+- Quotes must be exact text from the transcript. If no short exact quote stands out, write "None".
+- Recommendations belong in the final section only if the speaker clearly gives advice, steps, or actions.
+- Distinguish speaker opinions or claims from established facts when the wording makes that distinction clear.
+- Preserve temporal relationships and label flashbacks or flash-forwards.
+- Do not merge distinct events or transfer actions, causes, or consequences between them.
+
+Return Markdown with exactly these sections:
+
+## Main Points
+- 3-5 bullets with concrete supporting detail when present
+
+## Evidence & Examples
+- 2-4 notable details, caveats, disagreements, or examples; write "None" if unsupported
+
+## Exact Quotes
+- 0-2 short exact quotes; write "None" if none stand out
+
+## People & References
+- Clearly mentioned people, works, companies, products, or tools; write "None" if absent
+
+## Explicit Recommendations
+- Advice or actions clearly stated by the speaker; write "None" if absent`;
+
+const FINAL_SUMMARY_INSTRUCTIONS = `You are producing a final faithful summary of a video transcript.
+
+Rules:
+- Use only information in the supplied transcript or part analyses.
+- Deduplicate repetition without losing important one-off details.
+- Preserve material caveats, disagreements, conditions, and chronology.
+- Do not elevate speculation into fact or invent names, references, quotes, or recommendations.
+- Keep only exact transcript quotes and clearly stated recommendations.
+- Do not merge distinct events or transfer actions, causes, or consequences between them.
+- Prefer accuracy and signal over completeness. Write "None" for unsupported sections.
+
+Return Markdown with exactly these sections:
+
+## Overall Summary
+- 1 short paragraph capturing the central thesis or purpose
+
+## Main Points
+- 4-8 bullets covering the most important ideas with supporting detail
+
+## Important Details
+- 3-6 notable examples, caveats, disagreements, or rare important details
+
+## Exact Quotes
+- 0-3 strong exact quotes; write "None" if absent
+
+## People & References
+- Consolidated clearly mentioned people, works, companies, products, or tools
+
+## Explicit Recommendations
+- Advice or actions clearly stated by the speaker; write "None" if absent`;
+
 async function summarizeOversizedChunk(
   chunk: string,
   chunkNum?: number,
-  totalChunks?: number
-): Promise<string> {
+  totalChunks?: number,
+  complete: CompletionFunction = completeChat,
+  profile: ModelTaskProfile = PROVIDERS.SUMMARY
+): Promise<CompletionResult> {
   const wordCount = countWords(chunk);
   const splitWordCount = Math.max(
     SUMMARY_RETRY_SPLIT_MIN_WORDS,
@@ -1222,69 +1397,48 @@ async function summarizeOversizedChunk(
     } as too large; retrying as ${parts.length} smaller parts...`
   );
 
-  const summaries: string[] = [];
+  const summaries: CompletionResult[] = [];
   for (const part of parts) {
-    summaries.push(await summarizeChunk(part.text, part.index + 1, parts.length));
+    summaries.push(
+      await summarizeChunk(part.text, part.index + 1, parts.length, complete, profile)
+    );
   }
 
-  return completeChat(
-    PROVIDERS.SUMMARY_MODEL,
+  const combined = await complete(
+    profile,
     `You are combining summaries from smaller pieces of one transcript part. Preserve only claims supported by those piece summaries and keep the same section format.`,
     `Combine these smaller summaries back into one summary for original part ${
       chunkNum ?? "?"
     }${totalChunks ? ` of ${totalChunks}` : ""}:\n\n${summaries
-      .map((summary, index) => `=== Subpart ${index + 1} ===\n${summary}`)
+      .map((summary, index) => `=== Subpart ${index + 1} ===\n${summary.text}`)
       .join("\n\n")}`
   );
+  return {
+    text: combined.text,
+    metrics: aggregateMetrics(profile.model, [
+      ...summaries.map((summary) => summary.metrics),
+      combined.metrics,
+    ]),
+  };
 }
 
 async function summarizeChunk(
   chunk: string,
   chunkNum?: number,
-  totalChunks?: number
-): Promise<string> {
-  const chunkInfo =
-    totalChunks && totalChunks > 1 ? ` (part ${chunkNum} of ${totalChunks})` : "";
-  console.log(`Sending ${countWords(chunk)} words to ${PROVIDERS.SUMMARY_MODEL}...`);
+  totalChunks?: number,
+  complete: CompletionFunction = completeChat,
+  profile: ModelTaskProfile = PROVIDERS.SUMMARY
+): Promise<CompletionResult> {
+  const chunkInfo = totalChunks && totalChunks > 1
+    ? `This is part ${chunkNum} of ${totalChunks}. `
+    : "";
+  console.log(`Sending ${countWords(chunk)} words to ${profile.model}...`);
 
   try {
-    return await completeChat(
-      PROVIDERS.SUMMARY_MODEL,
-      `You are a careful transcript summarizer${chunkInfo}. Your job is faithful compression, not creative interpretation.
-
-Rules:
-- Use only information explicitly supported by the transcript.
-- Do not invent quotes, names, titles, books, papers, tools, companies, or recommendations.
-- Preserve technical terms and proper nouns exactly as written when they are clear.
-- If the transcript is ambiguous, noisy, or incomplete, say so briefly instead of guessing.
-- Quotes must be exact text from the transcript. If no short exact quote stands out, write "None".
-- Recommendations belong in the final section only if the speaker clearly gives advice, steps, or actions.
-- Distinguish speaker opinions or claims from established facts when the wording makes that distinction clear.
-- Preserve temporal relationships. Distinguish events occurring before, during, and after the main narrative, and label flashbacks or flash-forwards instead of grouping them into the surrounding period.
-- Do not merge distinct events or transfer actions, causes, or consequences between them. Preserve who or what did what, and in what sequence, when compressing related material.
-
-Return Markdown with exactly these sections:
-
-## Main Points
-- 3-5 bullets covering the most important ideas in this part
-- Each bullet should include concrete supporting detail, examples, or data when present
-
-## Evidence & Examples
-- 2-4 bullets with notable supporting details, examples, caveats, disagreements, or non-obvious claims that matter for understanding this part
-- Write "None" if this part is too thin or repetitive to support the section
-
-## Exact Quotes
-- 0-2 bullets with short exact quotes copied from the transcript
-- Write "None" if there is no strong quote
-
-## People & References
-- Bulleted list of clearly mentioned people, books, papers, companies, products, or tools
-- Write "None" if nothing specific is clearly named
-
-## Explicit Recommendations
-- Bulleted list of advice, steps, or actions clearly stated by the speaker
-- Write "None" if the speaker does not give explicit recommendations`,
-      `Analyze this transcript excerpt. Keep the summary faithful to this excerpt only.\n\n${chunk}`
+    return await complete(
+      profile,
+      CHUNK_SUMMARY_INSTRUCTIONS,
+      `${chunkInfo}Analyze this transcript excerpt and keep the summary faithful to this excerpt only.\n\n${chunk}`
     );
   } catch (error) {
     if (
@@ -1292,21 +1446,21 @@ Return Markdown with exactly these sections:
       isOpenAIRequestTooLarge(error.details) &&
       countWords(chunk) > SUMMARY_RETRY_SPLIT_MIN_WORDS
     ) {
-      return summarizeOversizedChunk(chunk, chunkNum, totalChunks);
+      return summarizeOversizedChunk(chunk, chunkNum, totalChunks, complete, profile);
     }
 
     throw error;
   }
 }
 
-async function summarizeTranscript(transcript: string): Promise<string> {
+async function summarizeTranscriptChunked(
+  transcript: string,
+  complete: CompletionFunction,
+  profile: ModelTaskProfile
+): Promise<CompletionResult> {
   const chunks = chunkTranscriptForSummary(transcript);
-  console.log(
-    `Summarizing ${countWords(transcript)} words with ${PROVIDERS.SUMMARY_MODEL}...`
-  );
-
   if (chunks.length <= 1) {
-    return summarizeChunk(transcript);
+    return summarizeChunk(transcript, undefined, undefined, complete, profile);
   }
 
   console.log(
@@ -1317,52 +1471,61 @@ async function summarizeTranscript(transcript: string): Promise<string> {
     SUMMARY_CHUNK_CONCURRENCY,
     async (chunk) => {
       console.log(`Summarizing chunk ${chunk.index + 1}/${chunks.length}...`);
-      return summarizeChunk(chunk.text, chunk.index + 1, chunks.length);
+      return summarizeChunk(chunk.text, chunk.index + 1, chunks.length, complete, profile);
     }
   );
 
-  return completeChat(
-    PROVIDERS.SUMMARY_MODEL,
-    `You are synthesizing analyses from different parts of one long video transcript into a final faithful summary.
-
-Rules:
-- Use only information present in the part analyses.
-- Deduplicate overlap without flattening away important one-off details.
-- Preserve important caveats, disagreements, and conditions when they materially change interpretation.
-- Do not elevate speculation into fact.
-- Keep exact quotes exactly as provided. If the quote quality is weak or unsupported, omit it.
-- Only include recommendations that are clearly stated by the speaker.
-- Preserve temporal relationships across parts. Distinguish events occurring before, during, and after the main narrative, and label flashbacks or flash-forwards instead of grouping them into the surrounding period.
-- Do not merge distinct events or transfer actions, causes, or consequences between them. Preserve who or what did what, and in what sequence, when compressing related material.
-- Prefer accuracy and signal over completeness. If a section is unsupported, write "None".
-
-Return Markdown with exactly these sections:
-
-## Overall Summary
-- 1 short paragraph capturing the central thesis or purpose of the video
-
-## Main Points
-- 4-8 bullets covering the most important ideas across the full transcript
-- Include specific supporting detail where available
-
-## Important Details
-- 3-6 bullets with notable examples, evidence, caveats, disagreements, or rare but important details that should not be lost
-- Write "None" only if the transcript is unusually repetitive and adds no material details
-
-## Exact Quotes
-- 0-3 bullets with the strongest exact quotes from the transcript
-- Write "None" if there are no strong quotes
-
-## People & References
-- Consolidated bulleted list of clearly mentioned people, books, papers, companies, products, or tools
-- Write "None" if nothing specific is clearly named
-
-## Explicit Recommendations
-- Consolidated bulleted list of advice, steps, or actions clearly stated by the speaker
-- Write "None" if the speaker does not give explicit recommendations`,
+  const combined = await complete(
+    profile,
+    FINAL_SUMMARY_INSTRUCTIONS,
     `Synthesize these part analyses into one final summary:\n\n${chunkSummaries
-      .map((summary, index) => `=== Part ${index + 1} ===\n${summary}`)
+      .map((summary, index) => `=== Part ${index + 1} ===\n${summary.text}`)
       .join("\n\n")}`
+  );
+  return {
+    text: combined.text,
+    metrics: aggregateMetrics(profile.model, [
+      ...chunkSummaries.map((summary) => summary.metrics),
+      combined.metrics,
+    ]),
+  };
+}
+
+export async function summarizeTranscript(
+  transcript: string,
+  complete: CompletionFunction = completeChat,
+  profile: ModelTaskProfile = PROVIDERS.SUMMARY
+): Promise<CompletionResult> {
+  const startedAt = performance.now();
+  const withWallClockDuration = (result: CompletionResult): CompletionResult => ({
+    ...result,
+    metrics: {
+      ...result.metrics,
+      durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    },
+  });
+  console.log(
+    `Summarizing ${countWords(transcript)} words with ${profile.model}...`
+  );
+  if (shouldUseDirectContext(transcript)) {
+    try {
+      console.log("Using one-pass long-context summarization...");
+      return withWallClockDuration(
+        await complete(
+          profile,
+          FINAL_SUMMARY_INSTRUCTIONS,
+          `Summarize this complete transcript faithfully.\n\n${transcript}`
+        )
+      );
+    } catch (error) {
+      if (!(error instanceof OpenAIRequestError) || !isOpenAIRequestTooLarge(error.details)) {
+        throw error;
+      }
+      console.log("Direct summary request was too large; falling back to chunked summarization...");
+    }
+  }
+  return withWallClockDuration(
+    await summarizeTranscriptChunked(transcript, complete, profile)
   );
 }
 
@@ -1570,31 +1733,61 @@ async function buildQaIndex(
   return index;
 }
 
-async function answerQuestion(index: RagIndex, question: string): Promise<string> {
-  const contextChunks = await selectRelevantChunks(
-    index,
-    question,
-    getEmbedding,
-    QA_CONTEXT_CHUNKS,
-    QA_MIN_RELEVANCE_SCORE
-  );
+export type QaContextMode = "full" | "retrieval";
 
-  if (contextChunks.length === 0) {
-    return UNSUPPORTED_ANSWER;
+export const getQaContextMode = (transcript: string): QaContextMode =>
+  shouldUseDirectContext(transcript) ? "full" : "retrieval";
+
+export const buildQaPromptInput = (
+  question: string,
+  transcript: string,
+  retrievedContext?: string
+): string =>
+  getQaContextMode(transcript) === "full"
+    ? `Question: ${question}\n\nComplete transcript:\n${transcript}`
+    : `Question: ${question}\n\nRetrieved transcript excerpts:\n${retrievedContext ?? ""}`;
+
+async function answerQuestion(
+  transcript: string,
+  question: string,
+  index?: RagIndex
+): Promise<CompletionResult> {
+  let context: string | undefined;
+  if (getQaContextMode(transcript) === "retrieval") {
+    if (!index) throw new Error("A Q&A retrieval index is required for long transcripts.");
+    const contextChunks = await selectRelevantChunks(
+      index,
+      question,
+      getEmbedding,
+      QA_CONTEXT_CHUNKS,
+      QA_MIN_RELEVANCE_SCORE
+    );
+    if (contextChunks.length === 0) {
+      const usage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+      return {
+        text: UNSUPPORTED_ANSWER,
+        metrics: {
+          model: PROVIDERS.QA.model,
+          ...usage,
+          durationMs: 0,
+          estimatedCostMicrousd: estimateCostMicrousd(PROVIDERS.QA.model, usage),
+        },
+      };
+    }
+    context = formatContext(contextChunks);
   }
 
-  const context = formatContext(contextChunks);
-
   return completeChat(
-    PROVIDERS.QA_MODEL,
+    PROVIDERS.QA,
     `You answer questions about a video transcript.
 
 Rules:
-- Use only the supplied transcript excerpts
-- If the answer is not supported by the excerpts, say so clearly
-- Quote or reference the most relevant excerpt when helpful
+- Use only the supplied transcript text
+- If the answer is not supported by the transcript, say so clearly
+- Quote or reference the most relevant passage when helpful
+- Preserve chronology and distinguish separate events
 - Be concise but specific`,
-    `Question: ${question}\n\nTranscript excerpts:\n${context}`
+    buildQaPromptInput(question, transcript, context)
   );
 }
 
@@ -1715,10 +1908,26 @@ export const runDoctor = async (): Promise<boolean> => {
   ];
 
   try {
-    const database = openDatabase();
-    database.db.query("SELECT 1 AS ok").get();
-    database.db.close(true);
-    checks.push({ label: "SQLite", ok: true, detail: database.path });
+    const databasePath = resolveDatabasePath();
+    if (!fs.existsSync(databasePath)) {
+      checks.push({
+        label: "SQLite",
+        ok: true,
+        detail: `${databasePath} (will be created on first run)`,
+      });
+    } else {
+      const database = new Database(databasePath, { readonly: true });
+      database.query("SELECT 1 AS ok").get();
+      const version = database.query("PRAGMA user_version").get() as {
+        user_version: number;
+      };
+      database.close(true);
+      checks.push({
+        label: "SQLite",
+        ok: true,
+        detail: `${databasePath} (schema ${version.user_version}; read-only check)`,
+      });
+    }
   } catch (error) {
     checks.push({
       label: "SQLite",
@@ -1741,7 +1950,7 @@ export const runDoctor = async (): Promise<boolean> => {
     console.log(`${check.ok ? "✓" : "✗"} ${check.label}: ${check.detail}`);
   }
   console.log(`\nLanguage: ${TRANSCRIPT_LANGUAGE}`);
-  console.log(`Models: ${PROVIDERS.SUMMARY_MODEL} summary, ${PROVIDERS.QA_MODEL} Q&A`);
+  console.log(`Models: ${PROVIDERS.SUMMARY.model} summary, ${PROVIDERS.QA.model} Q&A`);
   return checks.every((check) => check.ok);
 };
 
@@ -1915,7 +2124,7 @@ Interactive mode:
         .all(data.contentId) as QARow[];
 
       const selection = await expand({
-        message: `Questions (${PROVIDERS.QA_MODEL}):`,
+        message: `Questions (${PROVIDERS.QA.model}):`,
         expanded: true,
         choices: [
           { key: "n", name: "New question", value: "__new" },
@@ -2017,13 +2226,18 @@ Interactive mode:
         const trimmedQuestion = question.trim();
         if (!trimmedQuestion) continue;
 
-        if (!qaIndexPromise) {
+        if (getQaContextMode(data.transcript) === "retrieval" && !qaIndexPromise) {
           console.log("Indexing transcript for Q&A...");
           qaIndexPromise = buildQaIndex(database, data.contentId, data.transcript);
         }
 
-        const answer = await answerQuestion(await qaIndexPromise, trimmedQuestion);
-        console.log(`\nAnswer: ${answer}\n`);
+        const answer = await answerQuestion(
+          data.transcript,
+          trimmedQuestion,
+          qaIndexPromise ? await qaIndexPromise : undefined
+        );
+        console.log(`\nAnswer: ${answer.text}\n`);
+        console.log(`Q&A usage: ${formatRequestMetrics(answer.metrics)}\n`);
         storeQA(database, data.contentId, trimmedQuestion, answer);
         continue;
       }

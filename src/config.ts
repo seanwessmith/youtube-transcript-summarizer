@@ -1,24 +1,60 @@
+export type ReasoningEffort = "low" | "medium";
+export type TextVerbosity = "low" | "medium";
+
+export interface ModelTaskProfile {
+  model: string;
+  reasoningEffort: ReasoningEffort;
+  verbosity: TextVerbosity;
+}
+
 export const MODEL_PROFILES = {
   cheap: {
-    SUMMARY_MODEL: "gpt-5.4-nano",
-    QA_MODEL: "gpt-5.4-nano",
+    summary: {
+      model: "gpt-5.6-luna",
+      reasoningEffort: "low",
+      verbosity: "medium",
+    },
+    qa: {
+      model: "gpt-5.6-luna",
+      reasoningEffort: "low",
+      verbosity: "low",
+    },
   },
   balanced: {
-    SUMMARY_MODEL: "gpt-5.6-luna",
-    QA_MODEL: "gpt-5.4-nano",
+    summary: {
+      model: "gpt-5.6-terra",
+      reasoningEffort: "low",
+      verbosity: "medium",
+    },
+    qa: {
+      model: "gpt-5.6-luna",
+      reasoningEffort: "low",
+      verbosity: "low",
+    },
   },
   quality: {
-    SUMMARY_MODEL: "gpt-5.6-sol",
-    QA_MODEL: "gpt-5.6-luna",
+    summary: {
+      model: "gpt-5.6-sol",
+      reasoningEffort: "medium",
+      verbosity: "medium",
+    },
+    qa: {
+      model: "gpt-5.6-luna",
+      reasoningEffort: "low",
+      verbosity: "low",
+    },
   },
-} as const;
+} as const satisfies Record<
+  string,
+  { summary: ModelTaskProfile; qa: ModelTaskProfile }
+>;
 
 export type ModelProfile = keyof typeof MODEL_PROFILES;
 
 export interface AppConfig {
   modelProfile: ModelProfile;
-  summaryModel: string;
-  qaModel: string;
+  summary: ModelTaskProfile;
+  qa: ModelTaskProfile;
   embeddingModel: string;
   transcriptLanguage: string;
 }
@@ -36,17 +72,24 @@ export const getTranscriptLanguage = (
   rawValue = process.env.TRANSCRIPT_LANGUAGE
 ): string => rawValue?.trim() || "en";
 
-export const getAppConfig = (): AppConfig => {
-  const modelProfile = getModelProfile();
+export const getAppConfig = (
+  environment: NodeJS.ProcessEnv = process.env
+): AppConfig => {
+  const modelProfile = getModelProfile(environment.MODEL_PROFILE);
   const selectedProfile = MODEL_PROFILES[modelProfile];
 
   return {
     modelProfile,
-    summaryModel:
-      process.env.SUMMARY_MODEL?.trim() || selectedProfile.SUMMARY_MODEL,
-    qaModel: process.env.QA_MODEL?.trim() || selectedProfile.QA_MODEL,
+    summary: {
+      ...selectedProfile.summary,
+      model: environment.SUMMARY_MODEL?.trim() || selectedProfile.summary.model,
+    },
+    qa: {
+      ...selectedProfile.qa,
+      model: environment.QA_MODEL?.trim() || selectedProfile.qa.model,
+    },
     embeddingModel:
-      process.env.EMBEDDING_MODEL?.trim() || "text-embedding-3-small",
-    transcriptLanguage: getTranscriptLanguage(),
+      environment.EMBEDDING_MODEL?.trim() || "text-embedding-3-small",
+    transcriptLanguage: getTranscriptLanguage(environment.TRANSCRIPT_LANGUAGE),
   };
 };

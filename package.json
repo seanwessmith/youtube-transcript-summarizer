@@ -7,8 +7,9 @@
     "youtube": "if [ -n \"$NO_COLOR\" ]; then unset FORCE_COLOR; fi; bun run src/youtube.ts",
     "video": "if [ -n \"$NO_COLOR\" ]; then unset FORCE_COLOR; fi; bun run src/youtube.ts",
     "doctor": "if [ -n \"$NO_COLOR\" ]; then unset FORCE_COLOR; fi; bun run src/youtube.ts --doctor",
-    "typecheck": "if [ -n \"$NO_COLOR\" ]; then unset FORCE_COLOR; fi; tsc --noEmit",
-    "test": "if [ -n \"$NO_COLOR\" ]; then unset FORCE_COLOR; fi; bun test src"
+    "typecheck": "env -u FORCE_COLOR tsc --noEmit",
+    "test": "env -u FORCE_COLOR bun test src",
+    "eval": "if [ -n \"$NO_COLOR\" ]; then unset FORCE_COLOR; fi; bun run src/eval.ts"
   },
   "devDependencies": {
     "@types/bun": "1.3.14",
