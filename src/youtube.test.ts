@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
-import { extractVttText, getVideoId } from "./youtube.ts";
+import {
+  chunkTranscriptForSummary,
+  extractVttText,
+  getSummaryChunkConcurrency,
+  getVideoId,
+  parseContentInput,
+  sanitizeColorEnv,
+} from "./youtube.ts";
 
 describe("getVideoId", () => {
   test("parses common YouTube URL forms", () => {
@@ -14,7 +21,56 @@ describe("getVideoId", () => {
 
   test("rejects non-YouTube input", () => {
     expect(getVideoId("https://example.com/watch?v=dQw4w9WgXcQ")).toBe("");
+    expect(getVideoId("https://vimeo.com/1194116856?fl=pl&fe=sh")).toBe("");
+    expect(getVideoId("https://x.com/JohnathanBi/status/2068710558975590739")).toBe("");
     expect(getVideoId("not a video")).toBe("");
+  });
+});
+
+describe("parseContentInput", () => {
+  test("parses YouTube input with legacy storage IDs", () => {
+    expect(parseContentInput("https://youtu.be/dQw4w9WgXcQ?t=12")).toEqual({
+      contentType: "youtube",
+      sourceId: "dQw4w9WgXcQ",
+      contentId: "dQw4w9WgXcQ",
+      canonicalUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    });
+  });
+
+  test("parses Vimeo URL forms with provider-prefixed storage IDs", () => {
+    expect(parseContentInput("https://vimeo.com/1194116856?fl=pl&fe=sh")).toEqual({
+      contentType: "vimeo",
+      sourceId: "1194116856",
+      contentId: "vimeo:1194116856",
+      canonicalUrl: "https://vimeo.com/1194116856",
+    });
+
+    expect(parseContentInput("https://player.vimeo.com/video/1194116856")).toEqual({
+      contentType: "vimeo",
+      sourceId: "1194116856",
+      contentId: "vimeo:1194116856",
+      canonicalUrl: "https://vimeo.com/1194116856",
+    });
+  });
+
+  test("parses X and Twitter status URLs with provider-prefixed storage IDs", () => {
+    expect(
+      parseContentInput("https://x.com/JohnathanBi/status/2068710558975590739")
+    ).toEqual({
+      contentType: "x",
+      sourceId: "2068710558975590739",
+      contentId: "x:2068710558975590739",
+      canonicalUrl: "https://x.com/i/status/2068710558975590739",
+    });
+
+    expect(
+      parseContentInput("https://twitter.com/i/web/status/2068710558975590739")
+    ).toEqual({
+      contentType: "x",
+      sourceId: "2068710558975590739",
+      contentId: "x:2068710558975590739",
+      canonicalUrl: "https://x.com/i/status/2068710558975590739",
+    });
   });
 });
 
@@ -34,5 +90,121 @@ Second <c>line</c>
 `;
 
     expect(extractVttText(vtt)).toBe("First line Second line");
+  });
+
+  test("deduplicates YouTube rolling captions", () => {
+    const vtt = `WEBVTT
+Kind: captions
+Language: en
+
+00:00:00.240 --> 00:00:02.790 align:start position:0%
+This<00:00:00.480><c> is</c><00:00:00.719><c> the</c><00:00:01.040><c> story</c>
+
+00:00:02.790 --> 00:00:02.800 align:start position:0%
+This is the story
+
+00:00:02.800 --> 00:00:05.030 align:start position:0%
+This is the story
+of<00:00:03.120><c> the</c><00:00:03.280><c> Odyssey.</c>
+
+00:00:05.030 --> 00:00:05.040 align:start position:0%
+of the Odyssey.
+
+00:00:05.040 --> 00:00:08.310 align:start position:0%
+of the Odyssey.
+It<00:00:05.600><c> begins</c><00:00:05.920><c> after</c><00:00:06.640><c> Troy.</c>
+`;
+
+    expect(extractVttText(vtt)).toBe(
+      "This is the story of the Odyssey. It begins after Troy."
+    );
+  });
+
+  test("preserves repeated words spoken within one rolling cue", () => {
+    const vtt = `WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+No<00:00:00.500><c> no,</c><00:00:01.000><c> keep</c><00:00:01.500><c> going.</c>
+`;
+
+    expect(extractVttText(vtt)).toBe("No no, keep going.");
+  });
+});
+
+describe("sanitizeColorEnv", () => {
+  test("prefers NO_COLOR when FORCE_COLOR is also set", () => {
+    const originalNoColor = process.env.NO_COLOR;
+    const originalForceColor = process.env.FORCE_COLOR;
+
+    process.env.NO_COLOR = "1";
+    process.env.FORCE_COLOR = "1";
+    sanitizeColorEnv();
+
+    expect(process.env.NO_COLOR).toBe("1");
+    expect(process.env.FORCE_COLOR).toBeUndefined();
+
+    if (originalNoColor === undefined) {
+      delete process.env.NO_COLOR;
+    } else {
+      process.env.NO_COLOR = originalNoColor;
+    }
+
+    if (originalForceColor === undefined) {
+      delete process.env.FORCE_COLOR;
+    } else {
+      process.env.FORCE_COLOR = originalForceColor;
+    }
+  });
+});
+
+describe("chunkTranscriptForSummary", () => {
+  test("enforces both word and character budgets", () => {
+    const transcript = Array.from({ length: 80 }, (_, index) =>
+      `word${index}_${"x".repeat(90)}`
+    ).join(" ");
+
+    const chunks = chunkTranscriptForSummary(
+      transcript,
+      { maxWords: 50, overlapWords: 5 },
+      600
+    );
+
+    expect(chunks.length).toBeGreaterThan(2);
+    expect(chunks.every((chunk) => chunk.text.length <= 600)).toBe(true);
+    expect(chunks.every((chunk) => chunk.text.split(/\s+/).length <= 50)).toBe(true);
+    expect(chunks.map((chunk) => chunk.index)).toEqual(
+      chunks.map((_, index) => index)
+    );
+  });
+
+  test("balances character-budget splits instead of emitting tiny tails", () => {
+    const transcript = Array.from({ length: 100 }, (_, index) =>
+      `word${index.toString().padStart(3, "0")}`
+    ).join(" ");
+
+    const chunks = chunkTranscriptForSummary(
+      transcript,
+      { maxWords: 100, overlapWords: 0 },
+      740
+    );
+    const wordCounts = chunks.map((chunk) => chunk.text.split(/\s+/).length);
+
+    expect(chunks).toHaveLength(2);
+    expect(chunks.every((chunk) => chunk.text.length <= 740)).toBe(true);
+    expect(Math.min(...wordCounts)).toBeGreaterThanOrEqual(45);
+    expect(Math.max(...wordCounts)).toBeLessThanOrEqual(55);
+    expect(chunks.map((chunk) => chunk.index)).toEqual([0, 1]);
+    expect(chunks[0].startWord).toBe(0);
+    expect(chunks[0].endWord).toBe(chunks[1].startWord);
+    expect(chunks[1].endWord).toBe(100);
+  });
+});
+
+describe("getSummaryChunkConcurrency", () => {
+  test("defaults invalid values and caps high values", () => {
+    expect(getSummaryChunkConcurrency(undefined)).toBe(3);
+    expect(getSummaryChunkConcurrency("0")).toBe(3);
+    expect(getSummaryChunkConcurrency("4")).toBe(4);
+    expect(getSummaryChunkConcurrency("100")).toBe(8);
   });
 });

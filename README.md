@@ -1,6 +1,6 @@
-# YouTube Transcript Summarizer
+# Video Transcript Summarizer
 
-This project stores YouTube transcripts in SQLite, generates summaries with OpenAI, and supports transcript Q&A. It prefers downloaded captions and falls back to local Whisper transcription only when captions are unavailable.
+This project stores YouTube, Vimeo, and X video transcripts in SQLite, generates summaries with OpenAI, and supports transcript Q&A. It prefers downloaded captions and falls back to local Whisper transcription only when captions are unavailable.
 
 ## Requirements
 
@@ -34,23 +34,26 @@ Create `.env` in the project root:
 OPENAI_API_KEY=your_openai_api_key_here
 WHISPER_CLI_BIN=./whisper.cpp/build/bin/whisper-cli
 WHISPER_MODEL_PATH=./whisper.cpp/models/ggml-base.en.bin
+TRANSCRIPT_LANGUAGE=en
 ```
 
 Optional overrides:
 
-- `MODEL_PROFILE` (`cheap`, `balanced`, or `quality`; defaults to `balanced`)
+- `MODEL_PROFILE` (`cheap`, `balanced`, or `quality`; defaults to `cheap`)
 - `SUMMARY_MODEL`
 - `QA_MODEL`
 - `EMBEDDING_MODEL`
 - `YTDLP_BIN`
 - `FFMPEG_BIN`
 - `TRANSCRIPTS_DB`
+- `TRANSCRIPT_LANGUAGE` (caption and Whisper language; defaults to `en`)
+- `SUMMARY_CHUNK_CONCURRENCY` (defaults to `3`, maximum `8`)
 
 Model profiles:
 
 - `cheap`: `gpt-5.4-nano` for summaries and Q&A
-- `balanced`: `gpt-5.4-mini` for summaries, `gpt-5.4-nano` for Q&A
-- `quality`: `gpt-5.5` for summaries, `gpt-5.4-mini` for Q&A
+- `balanced`: `gpt-5.6-luna` for summaries, `gpt-5.4-nano` for Q&A
+- `quality`: `gpt-5.6-sol` for summaries, `gpt-5.6-luna` for Q&A
 
 Explicit `SUMMARY_MODEL` and `QA_MODEL` values override the selected profile.
 
@@ -58,6 +61,8 @@ Explicit `SUMMARY_MODEL` and `QA_MODEL` values override the selected profile.
 
 ```bash
 bun run youtube
+bun run video
+bun run doctor
 npm run start
 bun run typecheck
 bun run test
@@ -66,27 +71,66 @@ bun run test
 `bun run test` is scoped to this app's `src` tests so it does not run unrelated
 vendored tests inside `whisper.cpp`.
 
-## YouTube Flow
+## Video Flow
 
 ```bash
 bun run youtube
+bun run video
 ```
 
 The CLI can:
 
-- start a new YouTube session from a URL
+- start a new YouTube, Vimeo, or X video session from a URL
 - reopen saved sessions from SQLite
+- open the current summary as a proportional-font HTML document with the `o` hotkey
+- export a durable formatted HTML summary from the `e` menu
 - find a saved session semantically with `--find`
 - export stored Q&A to Markdown or JSON
 - reuse persisted embeddings for faster semantic find and transcript Q&A
+- validate local dependencies, SQLite, and OpenAI access with `--doctor`
 
 Non-interactive usage:
 
 ```bash
+bun run youtube "https://x.com/<USER>/status/<POST_ID>"
+bun run video "https://x.com/<USER>/status/<POST_ID>"
 bun run youtube --url "https://www.youtube.com/watch?v=<VIDEO_ID>"
+bun run youtube --url "https://vimeo.com/<VIDEO_ID>"
+bun run youtube --url "https://x.com/<USER>/status/<POST_ID>"
 bun run youtube --rerun "https://www.youtube.com/watch?v=<VIDEO_ID>"
+bun run youtube --rerun "https://vimeo.com/<VIDEO_ID>"
+bun run youtube --rerun "https://x.com/<USER>/status/<POST_ID>"
 bun run youtube --find "video about vector databases"
 bun run youtube --delete "https://www.youtube.com/watch?v=<VIDEO_ID>"
+bun run youtube --delete "https://vimeo.com/<VIDEO_ID>"
+bun run youtube --delete "https://x.com/<USER>/status/<POST_ID>"
+bun run youtube --doctor
 ```
 
-The `youtube` and `start` scripts both run the same CLI entrypoint: `src/youtube.ts`.
+The `youtube`, `video`, and `start` scripts run the same CLI entrypoint:
+`src/youtube.ts`.
+
+## Storage and reliability
+
+The app stores transcripts, summaries, Q&A, and cached embeddings in SQLite.
+Schema changes are tracked with SQLite's `user_version`. Before the first mutation
+of an existing database in each process, the app writes a timestamped backup to
+`db_backups/` and retains the ten newest backups.
+
+The application code is split into three main areas:
+
+- `src/youtube.ts`: provider retrieval, summarization, Q&A, and CLI interaction
+- `src/database.ts`: SQLite paths, migrations, backups, and transcript encoding
+- `src/config.ts`: model profiles and environment-driven configuration
+
+## Troubleshooting
+
+Run `bun run doctor` first. It reports missing executables or model files,
+database errors, a missing API key, and OpenAI connectivity failures.
+
+- Captions are requested using `TRANSCRIPT_LANGUAGE`. If none are available,
+  Whisper uses the same language value.
+- A language-specific Whisper model such as `base.en` should only be used for
+  that language. Use a multilingual Whisper model when changing the language.
+- Override inaccessible models with `SUMMARY_MODEL` and `QA_MODEL`.
+- Set `TRANSCRIPTS_DB` to use a specific database instead of automatic discovery.
