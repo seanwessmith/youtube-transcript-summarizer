@@ -261,4 +261,25 @@ describe("long-context routing", () => {
     expect(calls).toBe(2);
     expect(result.text).toBe("fallback summary");
   });
+
+  test("asks direct summaries to reject broken quotes and incidental references", async () => {
+    let instructions = "";
+    await summarizeTranscript("A normal transcript.", async (profile, system) => {
+      instructions = system;
+      return {
+        text: "summary",
+        metrics: {
+          model: profile.model,
+          inputTokens: 1,
+          cachedInputTokens: 0,
+          outputTokens: 1,
+          durationMs: 1,
+          estimatedCostMicrousd: 1,
+        },
+      };
+    });
+    expect(instructions).toContain("obvious caption glitches");
+    expect(instructions).toContain("rather than silently repairing them");
+    expect(instructions).toContain("Omit incidental name-drops and decorative analogies");
+  });
 });

@@ -1312,7 +1312,7 @@ Rules:
 - Do not invent quotes, names, titles, books, papers, tools, companies, or recommendations.
 - Preserve technical terms and proper nouns exactly as written when they are clear.
 - If the transcript is ambiguous, noisy, or incomplete, say so briefly instead of guessing.
-- Quotes must be exact text from the transcript. If no short exact quote stands out, write "None".
+- Quotes must be exact text from the transcript and clean enough to read verbatim. Omit quotes with obvious caption glitches, duplicated words, broken grammar, or distracting filler rather than silently repairing them. If no strong clean quote stands out, write "None".
 - Recommendations belong in the final section only if the speaker clearly gives advice, steps, or actions.
 - Distinguish speaker opinions or claims from established facts when the wording makes that distinction clear.
 - Preserve temporal relationships and label flashbacks or flash-forwards.
@@ -1330,7 +1330,7 @@ Return Markdown with exactly these sections:
 - 0-2 short exact quotes; write "None" if none stand out
 
 ## People & References
-- Clearly mentioned people, works, companies, products, or tools; write "None" if absent
+- Include only clearly mentioned people, works, companies, products, or tools that materially support the main argument or evidence. Omit incidental name-drops and decorative analogies; write "None" if absent
 
 ## Explicit Recommendations
 - Advice or actions clearly stated by the speaker; write "None" if absent`;
@@ -1342,7 +1342,8 @@ Rules:
 - Deduplicate repetition without losing important one-off details.
 - Preserve material caveats, disagreements, conditions, and chronology.
 - Do not elevate speculation into fact or invent names, references, quotes, or recommendations.
-- Keep only exact transcript quotes and clearly stated recommendations.
+- Keep only exact transcript quotes that are clean enough to read verbatim. Omit quotes with obvious caption glitches, duplicated words, broken grammar, or distracting filler rather than silently repairing them.
+- Keep only clearly stated recommendations.
 - Do not merge distinct events or transfer actions, causes, or consequences between them.
 - Prefer accuracy and signal over completeness. Write "None" for unsupported sections.
 
@@ -1361,7 +1362,7 @@ Return Markdown with exactly these sections:
 - 0-3 strong exact quotes; write "None" if absent
 
 ## People & References
-- Consolidated clearly mentioned people, works, companies, products, or tools
+- Consolidate only clearly mentioned people, works, companies, products, or tools that materially support the main argument or evidence. Omit incidental name-drops and decorative analogies
 
 ## Explicit Recommendations
 - Advice or actions clearly stated by the speaker; write "None" if absent`;
