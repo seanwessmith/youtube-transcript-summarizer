@@ -122,6 +122,9 @@ const WHISPER_MODEL_PATH =
 
 const DEFAULT_SUMMARY_CHUNK_CONCURRENCY = 3;
 const MAX_SUMMARY_CHUNK_CONCURRENCY = 8;
+const DEFAULT_YTDLP_CONCURRENT_FRAGMENTS = 8;
+const MAX_YTDLP_CONCURRENT_FRAGMENTS = 16;
+export const WHISPER_AUDIO_FORMAT_SELECTOR = "bestaudio[abr<=80]/bestaudio";
 
 export const getSummaryChunkConcurrency = (
   rawValue = process.env.SUMMARY_CHUNK_CONCURRENCY
@@ -132,6 +135,17 @@ export const getSummaryChunkConcurrency = (
   }
 
   return Math.min(parsed, MAX_SUMMARY_CHUNK_CONCURRENCY);
+};
+
+export const getYtDlpConcurrentFragments = (
+  rawValue = process.env.YTDLP_CONCURRENT_FRAGMENTS
+): number => {
+  const parsed = Number.parseInt(rawValue?.trim() ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_YTDLP_CONCURRENT_FRAGMENTS;
+  }
+
+  return Math.min(parsed, MAX_YTDLP_CONCURRENT_FRAGMENTS);
 };
 
 const appConfig = getAppConfig();
@@ -147,6 +161,7 @@ const SUMMARY_MAX_CHARS = 22000;
 const SUMMARY_RETRY_SPLIT_MIN_WORDS = 800;
 const SUMMARY_RETRY_SPLIT_OVERLAP_WORDS = 80;
 const SUMMARY_CHUNK_CONCURRENCY = getSummaryChunkConcurrency();
+const YTDLP_CONCURRENT_FRAGMENTS = getYtDlpConcurrentFragments();
 export const DIRECT_CONTEXT_MAX_CHARS = 500_000;
 const QA_CHUNK_CONFIG = { maxWords: 1200, overlapWords: 150 };
 const QA_CONTEXT_CHUNKS = 4;
@@ -489,9 +504,6 @@ const ensureLocalFile = (filePath: string, description: string) => {
     throw new Error(`${description} not found: ${filePath}`);
   }
 };
-
-const getYtDlpFfmpegLocation = (): string =>
-  FFMPEG_BIN.includes(path.sep) ? path.dirname(FFMPEG_BIN) : FFMPEG_BIN;
 
 const normalizeTranscriptText = (text: string): string =>
   text.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
@@ -901,24 +913,32 @@ async function transcribeVideoWithWhisper(videoUrl: string): Promise<string> {
 
   const tmpDir = createTempDir("video-transcribe-");
   const audioTemplate = path.join(tmpDir, "audio.%(ext)s");
-  const chunkTemplate = path.join(tmpDir, "chunk_%03d.mp3");
 
   try {
     try {
-      await $`${YTDLP_BIN} --no-warnings --ffmpeg-location ${getYtDlpFfmpegLocation()} -x --audio-format mp3 --audio-quality 128 -o ${audioTemplate} ${videoUrl}`.quiet();
+      await $`${YTDLP_BIN} --no-warnings --concurrent-fragments ${YTDLP_CONCURRENT_FRAGMENTS} -f ${WHISPER_AUDIO_FORMAT_SELECTOR} -o ${audioTemplate} ${videoUrl}`.quiet();
     } catch (error) {
       throw new Error(`yt-dlp audio download failed: ${describeProcessError(error)}`);
     }
 
     const audioFiles = listMatchingFiles(
       tmpDir,
-      (fileName) => fileName.startsWith("audio.") && fileName.endsWith(".mp3")
+      (fileName) =>
+        fileName.startsWith("audio.") &&
+        !fileName.endsWith(".part") &&
+        !fileName.endsWith(".ytdl")
     );
     const audioFile = audioFiles[0];
 
     if (!audioFile) {
-      throw new Error("yt-dlp did not produce an MP3 file for transcription.");
+      throw new Error("yt-dlp did not produce an audio file for transcription.");
     }
+
+    const audioExtension = path.extname(audioFile);
+    if (!audioExtension) {
+      throw new Error("yt-dlp produced an audio file without a usable extension.");
+    }
+    const chunkTemplate = path.join(tmpDir, `chunk_%03d${audioExtension}`);
 
     try {
       await $`${FFMPEG_BIN} -hide_banner -loglevel error -i ${audioFile} -f segment -segment_time 600 -c copy ${chunkTemplate}`.quiet();
@@ -928,12 +948,15 @@ async function transcribeVideoWithWhisper(videoUrl: string): Promise<string> {
 
     const chunkFiles = listMatchingFiles(
       tmpDir,
-      (fileName) => fileName.startsWith("chunk_") && fileName.endsWith(".mp3")
+      (fileName) =>
+        fileName.startsWith("chunk_") && path.extname(fileName) === audioExtension
     );
 
     if (chunkFiles.length === 0) {
       throw new Error("ffmpeg did not produce any audio chunks.");
     }
+
+    fs.rmSync(audioFile, { force: true });
 
     const transcriptParts: string[] = [];
 
@@ -970,6 +993,8 @@ async function transcribeVideoWithWhisper(videoUrl: string): Promise<string> {
         fs.readFileSync(transcriptPath, "utf8")
       );
       if (chunkTranscript) transcriptParts.push(chunkTranscript);
+      fs.rmSync(chunkFile, { force: true });
+      fs.rmSync(wavPath, { force: true });
     }
 
     const transcript = transcriptParts.join("\n\n").trim();

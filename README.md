@@ -48,6 +48,7 @@ Optional overrides:
 - `TRANSCRIPTS_DB`
 - `TRANSCRIPT_LANGUAGE` (caption and Whisper language; defaults to `en`)
 - `SUMMARY_CHUNK_CONCURRENCY` (defaults to `3`, maximum `8`)
+- `YTDLP_CONCURRENT_FRAGMENTS` (Whisper-fallback audio downloads; defaults to `8`, maximum `16`)
 
 Model profiles:
 
@@ -152,7 +153,9 @@ Run `bun run doctor` first. It reports missing executables or model files,
 database errors, a missing API key, and OpenAI connectivity failures.
 
 - Captions are requested using `TRANSCRIPT_LANGUAGE`. If none are available,
-  Whisper uses the same language value.
+  Whisper uses the same language value. The fallback prefers audio at or below
+  80 kbps, downloads fragmented streams concurrently, and segments the original
+  audio without a full-file MP3 transcode.
 - A language-specific Whisper model such as `base.en` should only be used for
   that language. Use a multilingual Whisper model when changing the language.
 - Override inaccessible models with `SUMMARY_MODEL` and `QA_MODEL`.

@@ -3,12 +3,14 @@ import { describe, expect, test } from "bun:test";
 import {
   DIRECT_CONTEXT_MAX_CHARS,
   OpenAIRequestError,
+  WHISPER_AUDIO_FORMAT_SELECTOR,
   buildQaPromptInput,
   chunkTranscriptForSummary,
   extractVttText,
   getQaContextMode,
   getSummaryChunkConcurrency,
   getVideoId,
+  getYtDlpConcurrentFragments,
   parseContentInput,
   sanitizeColorEnv,
   shouldUseDirectContext,
@@ -212,6 +214,19 @@ describe("getSummaryChunkConcurrency", () => {
     expect(getSummaryChunkConcurrency("0")).toBe(3);
     expect(getSummaryChunkConcurrency("4")).toBe(4);
     expect(getSummaryChunkConcurrency("100")).toBe(8);
+  });
+});
+
+describe("Whisper audio download settings", () => {
+  test("prefers speech-grade audio with a full-quality fallback", () => {
+    expect(WHISPER_AUDIO_FORMAT_SELECTOR).toBe("bestaudio[abr<=80]/bestaudio");
+  });
+
+  test("defaults invalid fragment concurrency and caps high values", () => {
+    expect(getYtDlpConcurrentFragments(undefined)).toBe(8);
+    expect(getYtDlpConcurrentFragments("0")).toBe(8);
+    expect(getYtDlpConcurrentFragments("12")).toBe(12);
+    expect(getYtDlpConcurrentFragments("100")).toBe(16);
   });
 });
 
