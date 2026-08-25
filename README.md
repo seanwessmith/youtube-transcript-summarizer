@@ -1,6 +1,10 @@
-# Video Transcript Summarizer
+# YouTube Transcript Summarizer
 
 This project stores YouTube, Vimeo, and X video transcripts in SQLite, generates summaries with OpenAI, and supports transcript Q&A. It prefers downloaded captions and falls back to local Whisper transcription only when captions are unavailable.
+
+![Synthetic CLI output showing a saved video summary](assets/summary-demo.svg)
+
+**Status:** maintained local-first CLI. Transcripts, summaries, Q&A, embeddings, and usage metrics stay in a local SQLite database unless a model request is explicitly made.
 
 ## Requirements
 
@@ -66,7 +70,6 @@ the selected profile's reasoning and verbosity settings.
 bun run youtube
 bun run video
 bun run doctor
-npm run start
 bun run typecheck
 bun run test
 ```
@@ -146,6 +149,10 @@ The application code is split into three main areas:
 - `src/database.ts`: SQLite paths, migrations, backups, and transcript encoding
 - `src/config.ts`: model profiles and environment-driven configuration
 - `src/openai-metrics.ts`: dated token pricing, usage aggregation, and formatting
+
+## License
+
+The application code is available under the [MIT License](LICENSE). The `whisper.cpp` submodule is vendored and remains under its own upstream license.
 
 ## Troubleshooting
 

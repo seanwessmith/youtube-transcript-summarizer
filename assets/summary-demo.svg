@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Synthetic YouTube Transcript Summarizer terminal output</title>
+  <desc id="desc">A terminal-style summary showing local storage, summary sections, model usage, and follow-up commands.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0e17"/>
+      <stop offset="1" stop-color="#151d2d"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="22" stdDeviation="28" flood-color="#000000" flood-opacity=".38"/>
+    </filter>
+  </defs>
+  <rect width="1600" height="900" rx="34" fill="url(#bg)"/>
+  <circle cx="1350" cy="100" r="300" fill="#61d6a8" opacity=".06"/>
+  <g filter="url(#shadow)">
+    <rect x="105" y="72" width="1390" height="756" rx="22" fill="#111722" stroke="#2b3647" stroke-width="2"/>
+    <rect x="105" y="72" width="1390" height="58" rx="22" fill="#1b2432"/>
+    <rect x="105" y="108" width="1390" height="22" fill="#1b2432"/>
+  </g>
+  <circle cx="144" cy="101" r="8" fill="#ef6b73"/>
+  <circle cx="172" cy="101" r="8" fill="#e9b949"/>
+  <circle cx="200" cy="101" r="8" fill="#56c596"/>
+  <text x="800" y="107" text-anchor="middle" fill="#8f9cad" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">video-transcript-summarizer — synthetic example</text>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+    <text x="150" y="178" fill="#61d6a8" font-size="19" font-weight="700">$ bun run youtube --url "https://youtube.com/watch?v=example"</text>
+    <text x="150" y="222" fill="#8f9cad" font-size="17">✓ Captions downloaded · 42:18 · English</text>
+    <text x="150" y="254" fill="#8f9cad" font-size="17">✓ Transcript stored locally · SQLite schema 2</text>
+    <text x="150" y="286" fill="#8f9cad" font-size="17">✓ One-pass summary · gpt-5.6-luna · 18.4s</text>
+
+    <text x="150" y="354" fill="#f3f6fb" font-size="24" font-weight="700">How reliable AI systems earn trust</text>
+    <line x1="150" y1="374" x2="1448" y2="374" stroke="#2c3849"/>
+
+    <text x="150" y="424" fill="#a7b6ff" font-size="18" font-weight="700">Core argument</text>
+    <text x="150" y="458" fill="#d5dce7" font-size="17">Trust comes from visible evidence, bounded actions, and recovery paths—</text>
+    <text x="150" y="487" fill="#d5dce7" font-size="17">not from making a model sound more certain.</text>
+
+    <text x="150" y="544" fill="#a7b6ff" font-size="18" font-weight="700">Key ideas</text>
+    <text x="150" y="578" fill="#d5dce7" font-size="17">• Keep source references attached to consequential claims.</text>
+    <text x="150" y="610" fill="#d5dce7" font-size="17">• Separate probabilistic reasoning from deterministic execution.</text>
+    <text x="150" y="642" fill="#d5dce7" font-size="17">• Design explicit review and rollback points.</text>
+
+    <rect x="150" y="690" width="770" height="74" rx="12" fill="#182333" stroke="#2c3b50"/>
+    <text x="176" y="720" fill="#8f9cad" font-size="14">USAGE</text>
+    <text x="176" y="747" fill="#d5dce7" font-size="16">21,406 input · 1,188 output · $0.0041 estimated</text>
+
+    <text x="1010" y="708" fill="#8f9cad" font-size="14">NEXT</text>
+    <text x="1010" y="739" fill="#61d6a8" font-size="16">[q] ask  [e] export  [o] open</text>
+  </g>
+</svg>
