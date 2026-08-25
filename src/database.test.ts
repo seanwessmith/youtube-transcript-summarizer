@@ -44,7 +44,7 @@ describe("database", () => {
     expect(() => database.db.run(
       "INSERT INTO qa (content_id, question, answer) VALUES ('missing', 'q', 'a')"
     )).toThrow();
-    database.db.close(true);
+    database.db.close();
   });
 
   test("round-trips compressed and legacy plain transcripts", () => {
@@ -61,7 +61,7 @@ describe("database", () => {
     clearCachedEmbeddings(database.db, "video");
     expect(database.db.query("SELECT count(*) AS count FROM content_embeddings").get()).toEqual({ count: 0 });
     expect(database.db.query("SELECT count(*) AS count FROM transcript_chunk_embeddings").get()).toEqual({ count: 0 });
-    database.db.close(true);
+    database.db.close();
   });
 
   test("backs up an existing database before its first mutation", () => {
@@ -69,11 +69,11 @@ describe("database", () => {
     const dbPath = path.join(dir, "transcripts.sqlite");
     const first = openDatabase(dbPath);
     first.db.run("INSERT INTO content (content_id, content_type) VALUES ('video', 'youtube')");
-    first.db.close(true);
+    first.db.close();
     const reopened = openDatabase(dbPath);
     backupDatabaseIfNeeded(reopened);
     expect(fs.readdirSync(path.join(dir, "db_backups"))).toHaveLength(1);
-    reopened.db.close(true);
+    reopened.db.close();
   });
 
   test("honors an explicit database path", () => {
@@ -96,7 +96,7 @@ describe("database", () => {
       DROP TABLE qa;
       ALTER TABLE qa_v1 RENAME TO qa;
     `);
-    legacy.db.close(true);
+    legacy.db.close();
 
     const migrated = openDatabase(dbPath);
     expect(
@@ -105,6 +105,6 @@ describe("database", () => {
     expect(
       (migrated.db.query("PRAGMA user_version").get() as { user_version: number }).user_version
     ).toBe(2);
-    migrated.db.close(true);
+    migrated.db.close();
   });
 });
